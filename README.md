@@ -11,12 +11,12 @@ and Mobarak I. Hoque*
 
 ---
 
-<!-- <table align="center">
+<table align="center">
   <tr>
-    <td><b><a href="https://arxiv.org/">arXiv</a></b></td>
-    <td><b><a href="https://link.springer.com/">Paper</a></b></td>
+    <td><b><a href="https://arxiv.org/abs/2511.03325">arXiv</a></b></td>
+    <!-- <td><b><a href="https://link.springer.com/">Paper</a></b></td> -->
   </tr>
-</table> -->
+</table>
 
 </div>
 
