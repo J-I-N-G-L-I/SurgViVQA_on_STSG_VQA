@@ -64,22 +64,21 @@ REAL-Colon-VQA covers **6 reasoning domains**, each with multiple question categ
 - **Operation Notes** – e.g., `procedure_stage`, `withdrawal_phase`
 - **Movement** – e.g., `scope_motion`, `camera_translation`
 
-<!-- ## Citation
+## Citation
 
 If you use this code, please cite:
 
 ```
-@inproceedings{SurgViVQA,
-  title={SurgViVQA: Temporally-Grounded Video Question Answering for Surgical Scene Understanding},
-  author={
-    Mauro Orazio Drago, Luca Carlini, Dennis Pierantozzi,
-    Pelinsu Celebi Balyemez, Chiara Lena, Cesare Hassan,
-    Danail Stoyanov, Sophia Bano, Elena De Momi,
-    and Mobarak I. Hoque
-  },
-  booktitle={<Conference/Journal Name>},
-  year={2026}
+@misc{drago2025surgvivqa,
+  title        = {SurgViVQA: Temporally-Grounded Video Question Answering for Surgical Scene Understanding},
+  author       = {Mauro Orazio Drago and Luca Carlini and Pelinsu Celebi Balyemez and Dennis Pierantozzi and Chiara Lena and Cesare Hassan and Danail Stoyanov and Elena De Momi and Sophia Bano and Mobarak I. Hoque},
+  year         = {2025},
+  eprint       = {2511.03325},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.CV},
+  url          = {https://arxiv.org/abs/2511.03325},
+  note         = {Under revision}
 }
 
 ```
- -->
+

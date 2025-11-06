@@ -54,7 +54,7 @@ Key features:
 - **Video clips:** 8-frame clips with stride 4  
 - **Q&A pairs:** Each clip is paired with both long-form and short-form answers  
 - **Reasoning domains:** 18 question categories grouped into 6 domains (Instruments, Sizing, Diagnosis, Positions, Operation Notes, Movement)  
-- **Dataset size:** ** 5,200 QA instances for each answer type (long-form and short-form)  
+- **Dataset size:** 5,200 QA instances for each answer type (long-form and short-form)  
 - **Temporal reasoning:** Captures endoscope and lesion motion, lighting changes, occlusions  
 
 > **Note:** The annotations are included in the repository under the folder `REAL-Colon-VQA_annotations`.
@@ -139,21 +139,20 @@ python -m evaluation --dataset realcolon --batch_size 16 --seq_length 64 --worke
 The pre-trained SurgViVQA model weights are available via [Google Drive](https://drive.google.com/drive/folders/10ksHypCl7lBSQjV70VGoQaR6GsS3498a?usp=sharing).
 
 
-<!-- ## Citation
+## Citation
 
 If you use this code, please cite:
 
 ```
-@inproceedings{SurgViVQA,
-  title={SurgViVQA: Temporally-Grounded Video Question Answering for Surgical Scene Understanding},
-  author={
-    Mauro Orazio Drago, Luca Carlini, Dennis Pierantozzi,
-    Pelinsu Celebi Balyemez, Chiara Lena, Cesare Hassan,
-    Danail Stoyanov, Sophia Bano, Elena De Momi,
-    and Mobarak I. Hoque
-  },
-  booktitle={<Conference/Journal Name>},
-  year={2026}
+@misc{drago2025surgvivqa,
+  title        = {SurgViVQA: Temporally-Grounded Video Question Answering for Surgical Scene Understanding},
+  author       = {Mauro Orazio Drago and Luca Carlini and Pelinsu Celebi Balyemez and Dennis Pierantozzi and Chiara Lena and Cesare Hassan and Danail Stoyanov and Elena De Momi and Sophia Bano and Mobarak I. Hoque},
+  year         = {2025},
+  eprint       = {2511.03325},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.CV},
+  url          = {https://arxiv.org/abs/2511.03325},
+  note         = {Under revision}
 }
 
-``` -->
+```
