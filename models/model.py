@@ -1,104 +1,140 @@
 import torch
 import torch.nn as nn
 
-from transformers import AutoImageProcessor, VideoMAEModel, VideoMAEConfig  # VideoMAE video encoder
+from transformers import AutoImageProcessor, VideoMAEModel, VideoMAEConfig
 from transformers import BlipTextModel
-
 from peft import get_peft_model
 
 
 class SurgViVQA(nn.Module):
     """
-    SurgViVQA: Masked Video–Text Encoder + LoRA-adapted LLM for surgical video VQA.
+    SurgViVQA = VideoMAE (video encoder) + BLIP text encoder (cross-attn to video) + LoRA-adapted LLM (e.g. GPT-2)
 
-    Architecture:
-    1. Video Encoder (VideoMAE) → Extracts spatiotemporal embeddings from video clips
-    2. Text Encoder (BLIP) → Encodes questions, cross-attends to video embeddings
-    3. LoRA-adapted LLM → Autoregressively generates free-form answers
+    IMPORTANT:
+      - VideoMAEConfig.num_frames MUST match dataset num_frames.
+      - BLIP word embedding MUST be resized to match the tokenizer vocab size used in training (often GPT-2 = 50257),
+        otherwise loading checkpoint will size-mismatch.
     """
-    def __init__(self, device=torch.device('cpu'), tokenizer=None, decoder_model=None, peft_config=None):
-        super(SurgViVQA, self).__init__()
-        
+    def __init__(
+        self,
+        device=torch.device("cpu"),
+        tokenizer=None,
+        decoder_model=None,
+        peft_config=None,
+        num_frames: int = 8,
+    ):
+        super().__init__()
         self.device = device
 
-        model_name = "MCG-NJU/videomae-base"  # change to desired HF VideoMAE checkpoint
-        print("Visual Encoder version: ", model_name)
+        if tokenizer is None:
+            raise ValueError("tokenizer must be provided (e.g., GPT-2 tokenizer).")
+        self.tokenizer = tokenizer
+
+        # 1) Visual encoder (VideoMAE)
+        model_name = "MCG-NJU/videomae-base"
+        print("Visual Encoder version:", model_name)
 
         config = VideoMAEConfig.from_pretrained(
             model_name,
-            cache_dir="/SAN/medic/Kvasir/hf_models/transformers"
+            cache_dir="/scratch/sc232jl/.cache/huggingface",
         )
-        config.num_frames = 8
+        config.num_frames = int(num_frames)
 
         self.visual_encoder = VideoMAEModel.from_pretrained(
             model_name,
             config=config,
-            cache_dir="/SAN/medic/Kvasir/hf_models/transformers",
+            cache_dir="/scratch/sc232jl/.cache/huggingface",
             ignore_mismatched_sizes=True,
         )
-
         self.processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
 
         # Freeze video encoder params
-        for param in self.visual_encoder.parameters():
-            param.requires_grad = False
-        print("Frozen Visual Encoder (VideoMAE)")
+        for p in self.visual_encoder.parameters():
+            p.requires_grad = False
 
-        # Unfreeze patch embedding (Conv3d)
-        for param in self.visual_encoder.embeddings.patch_embeddings.projection.parameters():
-            param.requires_grad = True
+        # 2) Text encoder (BLIP text model with cross-attn)
+        self.text_encoder = BlipTextModel.from_pretrained(
+            "Salesforce/blip-vqa-base",
+            cache_dir="/scratch/sc232jl/.cache/huggingface",
+        )
 
-        # Unfreeze final layernorm
-        for param in self.visual_encoder.layernorm.parameters():
-            param.requires_grad = True
+        # ---- CRITICAL: resize BLIP word embeddings to match tokenizer vocab size ----
+        self._resize_blip_word_embeddings(new_vocab_size=len(self.tokenizer))
 
-        # tokenizer
-        self.tokenizer = tokenizer
-        self.tokenizer.pad_token = self.tokenizer.eos_token  # EOS used as padding
+        # 3) LLM decoder (LoRA optional)
+        if decoder_model is None:
+            raise ValueError("decoder_model is required, e.g. AutoModelForCausalLM.from_pretrained('gpt2').")
+        self.llm = decoder_model
+        if peft_config is not None:
+            self.llm = get_peft_model(self.llm, peft_config)
 
-        # text encoder (BLIP)
-        self.text_encoder = BlipTextModel.from_pretrained("Salesforce/blip-vqa-base", ignore_mismatched_sizes=True)
+    def _resize_blip_word_embeddings(self, new_vocab_size: int):
+        """
+        Expand BLIP text encoder's word_embeddings from original vocab (e.g., 30524) to new_vocab_size (e.g., 50257).
+        This must happen BEFORE loading the fine-tuned checkpoint, otherwise state_dict size mismatch occurs.
+        """
+        if not hasattr(self.text_encoder, "embeddings") or not hasattr(self.text_encoder.embeddings, "word_embeddings"):
+            raise RuntimeError("Unexpected BLIP text encoder structure: cannot find embeddings.word_embeddings.")
 
-        # --- Expand BLIP embedding layer to match tokenizer ---
-        original_weights = self.text_encoder.embeddings.word_embeddings.weight.data
-        new_vocab_size = len(self.tokenizer)
-        blip_internal_emb_dim = self.text_encoder.embeddings.word_embeddings.embedding_dim
-        new_embeddings = nn.Embedding(new_vocab_size, blip_internal_emb_dim)
-        original_vocab_size = original_weights.shape[0]
-        new_embeddings.weight.data[:original_vocab_size] = original_weights
-        self.text_encoder.embeddings.word_embeddings = new_embeddings
+        old_emb: nn.Embedding = self.text_encoder.embeddings.word_embeddings
+        old_vocab_size, hidden = old_emb.weight.shape
 
-        # decoder
-        self.decoder_model = decoder_model
-        self.llm = get_peft_model(decoder_model, peft_config)
-        self.llm.print_trainable_parameters()  # Verify trainable LoRA params
+        if int(new_vocab_size) == int(old_vocab_size):
+            return
 
+        if new_vocab_size < old_vocab_size:
+            print(f"[WARN] new_vocab_size ({new_vocab_size}) < old_vocab_size ({old_vocab_size}), truncating embeddings.")
+            new_emb = nn.Embedding(new_vocab_size, hidden)
+            with torch.no_grad():
+                new_emb.weight.copy_(old_emb.weight[:new_vocab_size])
+            self.text_encoder.embeddings.word_embeddings = new_emb
+            if hasattr(self.text_encoder, "config") and hasattr(self.text_encoder.config, "vocab_size"):
+                self.text_encoder.config.vocab_size = int(new_vocab_size)
+            return
 
-    def forward(self, video, qa_inputs_ids, qa_att_mask):
+        print(f"[INFO] Resizing BLIP word_embeddings: {old_vocab_size} -> {new_vocab_size}")
+        new_emb = nn.Embedding(new_vocab_size, hidden)
+        with torch.no_grad():
+            new_emb.weight[:old_vocab_size].copy_(old_emb.weight)
+            old_mean = old_emb.weight.mean().item()
+            old_std = old_emb.weight.std().item()
+            new_emb.weight[old_vocab_size:].normal_(mean=old_mean, std=old_std)
 
-        # VIDEO FRAMES HANDLER CODE (sequences of images)
-        # video: [batch, frames, 3, 224, 224]
-        video = video.to(self.device)
-        video_embeds = self.visual_encoder(pixel_values=video).last_hidden_state  # (batch, num_patches+1, hidden_dim)
+        self.text_encoder.embeddings.word_embeddings = new_emb
+        if hasattr(self.text_encoder, "config") and hasattr(self.text_encoder.config, "vocab_size"):
+            self.text_encoder.config.vocab_size = int(new_vocab_size)
 
-        video_atts = torch.ones(video_embeds.size()[:-1],
-                                dtype=torch.long,
-                                device=video.device)
+    def encode_video(self, video: torch.Tensor):
+        """
+        video: [B, T, 3, 224, 224]
+        returns:
+          video_embeds: [B, V, D]
+          video_atts:   [B, V]
+        """
+        out = self.visual_encoder(pixel_values=video)
+        video_embeds = out.last_hidden_state
+        video_atts = torch.ones(video_embeds.size()[:-1], dtype=torch.long, device=video_embeds.device)
+        return video_embeds, video_atts
 
-        # multimodal encoder (BLIP text with cross-attention over video tokens)
-        text_output = self.text_encoder(
+    def forward(self, video, qa_inputs_ids, qa_att_mask, video_embeds=None, video_atts=None):
+        """
+        If video_embeds/video_atts are provided (as in closed decoding scoring),
+        we skip encode_video for speed.
+        """
+        if video_embeds is None or video_atts is None:
+            video_embeds, video_atts = self.encode_video(video)
+
+        text_out = self.text_encoder(
             input_ids=qa_inputs_ids,
             attention_mask=qa_att_mask,
             encoder_hidden_states=video_embeds,
             encoder_attention_mask=video_atts,
-            return_dict=True
+            return_dict=True,
         )
-        text_embeds = text_output.last_hidden_state
-        
-        # text decoder (LoRA-adapted LLM)
-        llm_output = self.llm(
+        text_embeds = text_out.last_hidden_state
+
+        llm_out = self.llm(
             inputs_embeds=text_embeds,
-            encoder_attention_mask=qa_att_mask
+            attention_mask=qa_att_mask,
         )
-        
-        return llm_output.logits
+        return llm_out.logits

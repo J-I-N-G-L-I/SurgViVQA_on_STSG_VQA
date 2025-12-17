@@ -84,7 +84,9 @@ if __name__ == '__main__':
     if args.dataset == 'realcolon':
 
         # Path to the REAL-Colon-VQA dataset
-        folder_name = '/SAN/medic/Kvasir/REAL-Colon-VQA' # to substitute with actual dataset location
+        # folder_name = '/SAN/medic/Kvasir/REAL-Colon-VQA' # to substitute with actual dataset location
+
+        folder_name = '/mnt/scratch/sc232jl/SurgViVQA/REAL-Colon-VQA_annotations'
 
         train_seq = ['002-001', '002-002', '002-003', '002-004', '002-005']
         val_seq = ['002-006']

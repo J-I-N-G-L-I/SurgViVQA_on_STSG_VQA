@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+
+.env
+*.key
+secrets.json
+
+
+# folders
+checkpoints/
+hf_models/
+logs/
+REAL-Colon-VQA_annotations/
+stsg_eval_outputs_full/
+SurgViVQA_checkpoint/
+
+# visual envs
+venv/
+env/
+.conda/

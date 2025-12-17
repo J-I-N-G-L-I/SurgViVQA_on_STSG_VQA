@@ -1,144 +1,530 @@
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 from tqdm import tqdm
 
 
-def batch_greedy_search(images, questions, model, tokenizer, max_length, device):
+def _clean_text(x: Any) -> str:
+    if x is None:
+        return ""
+    if not isinstance(x, str):
+        x = str(x)
+    return x.strip()
+
+
+def _parse_choice_K_from_question(q: str) -> Optional[int]:
+    if not q:
+        return None
+    qq = q.strip().lower()
+    m = re.search(r"(answer|reply)\s*(with\s*(a\s*)?number\s*)?1\s*(\-|–|to)\s*(\d+)\b", qq)
+    if m:
+        try:
+            return int(m.group(5))
+        except Exception:
+            return None
+    return None
+
+
+def _parse_bool_pred(text: str) -> Optional[int]:
+    if not text:
+        return None
+    t = text.strip().lower()
+    if re.search(r"\b(yes|true)\b", t):
+        return 1
+    if re.search(r"\b(no|false)\b", t):
+        return 0
+    m = re.search(r"\b([01])\b", t)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _infer_label_type_from_meta(question: str, meta: Dict[str, Any]) -> str:
+    lt = (meta.get("label_type") or "").lower().strip()
+    if not lt:
+        lt = (meta.get("answer_mode") or "").lower().strip()
+    if not lt:
+        lt = (meta.get("answer_type") or "").lower().strip()
+
+    if lt in ("binary", "boolean", "bin", "yesno", "yes/no"):
+        lt = "bool"
+    if lt in ("choice", "mcq", "multi_choice", "multichoice", "option", "index"):
+        lt = "choice_index"
+    if lt in ("numeric", "number", "float", "int", "reg"):
+        lt = "seconds"
+    if lt in ("cat", "text", "string", "phrase"):
+        lt = "text"
+
+    # question cue
+    if _parse_choice_K_from_question(question) is not None:
+        return "choice_index"
+
+    # category cues
+    cat = (meta.get("category") or "").lower().strip()
+    if cat == "count":
+        return "count"
+    if cat == "duration":
+        return "duration"
+    if cat == "motion":
+        return "text"
+
+    return lt or "text"
+
+
+def _load_closed_labels(vocabs_json: str) -> Dict[str, List[str]]:
+    with open(vocabs_json, "r", encoding="utf-8") as f:
+        voc = json.load(f)
+    out: Dict[str, List[str]] = {}
+    for k, arr in voc.items():
+        if not isinstance(arr, list):
+            continue
+        kk = str(k).lower()
+        out[kk] = [str(x) for x in arr]
+    return out
+
+
+def _labels_for_category(closed_labels: Dict[str, List[str]], cat: str) -> List[str]:
     """
-    Performs greedy decoding to generate text answers for a batch of image-question pairs.
-
-    Args:
-        images (torch.Tensor): Batch of visual features or image tensors.
-        questions (list[str]): List of text questions corresponding to each image.
-        model (torch.nn.Module): Trained VQA model for generating answers.
-        tokenizer: Tokenizer used for encoding/decoding text.
-        max_length (int): Maximum sequence length for generation.
-        device (torch.device): Device to run the computation on.
-
-    Returns:
-        list[str]: Generated text answers.
+    Use vocab labels as closed candidates.
+    By default, drop <UNK> to avoid degenerate selection, except for motion where <UNK> is explicitly defined.
     """
+    labels = closed_labels.get(cat, [])
+    if not labels:
+        return labels
+    if cat == "motion":
+        return labels
+    return [x for x in labels if x.strip() != "<UNK>"]
 
-    answers = []
-    batch_size = len(questions)
 
-    model.eval()
+def _build_prompt(question: str, meta: Dict[str, Any], closed_labels: Optional[Dict[str, List[str]]] = None) -> str:
+    q = _clean_text(question)
+
+    label_type = _infer_label_type_from_meta(q, meta)
+    cat = (meta.get("category") or "").lower().strip()
+    if cat == "phase":
+        cat = "phase_transition"
+
+    K = meta.get("choice_K", None)
+    if K is None:
+        K = _parse_choice_K_from_question(q)
+
+    choices = meta.get("choices", None)
+
+    if label_type == "bool":
+        instr = "Answer with only YES or NO."
+    elif label_type in ("seconds", "duration"):
+        instr = "Answer with only a number (can be float)."
+    elif label_type == "count":
+        instr = "Answer with only an integer number."
+    elif label_type == "choice_index" or (choices is not None) or (isinstance(K, int) and K > 0):
+        if isinstance(K, int) and K > 0:
+            instr = f"Answer with only a number 1-{K}."
+        else:
+            instr = "Select the best option and answer with only the option number (1,2,3,...)."
+    else:
+        if closed_labels is not None and cat in closed_labels:
+            lbls = _labels_for_category(closed_labels, cat)
+            if len(lbls) <= 60:
+                instr = "Answer with exactly one label from: " + ", ".join(lbls) + "."
+            else:
+                instr = "Answer with a short phrase."
+        elif cat == "motion":
+            instr = (
+                "Answer with exactly one label from: "
+                "<UNK>, decrease, downward, increase, leftward, nearly unchanged, rightward, stationary, upward."
+            )
+        else:
+            instr = "Answer with a short phrase."
+
+    opt_block = ""
+    if (label_type == "choice_index" or choices is not None) and isinstance(choices, list) and len(choices) > 0:
+        lines = [f"{i}) {str(c)}" for i, c in enumerate(choices, start=1)]
+        opt_block = "\nOptions:\n" + "\n".join(lines)
+
+    rat = meta.get("rationale", None)
+    rat_block = ""
+    if isinstance(rat, str) and rat.strip():
+        rat_block = "\nContext:\n" + rat.strip()
+
+    prompt = (
+        f"Question: {q}"
+        f"{opt_block}"
+        f"{rat_block}\n"
+        f"{instr}\n"
+        f"FINAL_ANSWER:"
+    )
+    return prompt
+
+
+def _encode_video_cached(model, images: torch.Tensor, device) -> Tuple[torch.Tensor, torch.Tensor]:
+    images = images.to(device)
+    if hasattr(model, "encode_video"):
+        with torch.no_grad():
+            return model.encode_video(images)
     with torch.no_grad():
-        # Prepare the text prompts for the entire batch like "Question: <q> Answer:"
-        prompt_texts = [f"Question: {q}\nAnswer:" for q in questions]
+        video_embeds = model.visual_encoder(pixel_values=images).last_hidden_state
+        video_atts = torch.ones(video_embeds.size()[:-1], dtype=torch.long, device=device)
+    return video_embeds, video_atts
 
-        # Tokenize the prompts with padding to handle varying lengths
-        prompt_inputs = tokenizer(
-            prompt_texts,
-            return_tensors="pt",
-            padding='longest',
-            add_special_tokens=False
-        )
 
-        # Prepare model inputs
-        padded_input_ids = torch.zeros((batch_size, max_length), dtype=torch.long, device=device)
-        padded_attention_mask = torch.zeros((batch_size, max_length), device=device)
+def _forward_logits(
+    model,
+    qa_input_ids: torch.Tensor,
+    qa_att_mask: torch.Tensor,
+    video_embeds: torch.Tensor,
+    video_atts: torch.Tensor,
+) -> torch.Tensor:
+    return model(
+        video=None,
+        qa_inputs_ids=qa_input_ids,
+        qa_att_mask=qa_att_mask,
+        video_embeds=video_embeds,
+        video_atts=video_atts,
+    )
 
-        orig_length = prompt_inputs['input_ids'].size(1)
-        padded_input_ids[:, :orig_length] = prompt_inputs['input_ids']
-        padded_attention_mask[:, :orig_length] = prompt_inputs['attention_mask']
 
-        images = images.to(device)
+def _score_completions_logprob_batched(
+    model,
+    tokenizer,
+    prompt_ids: torch.Tensor,          # (Li,)  !!! MUST be true length, no padding
+    video_embeds_1: torch.Tensor,      # (1, V, D)
+    video_atts_1: torch.Tensor,        # (1, V)
+    completions: List[str],
+    device,
+    batch_size: int = 32,
+) -> List[float]:
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    prompt_len = int(prompt_ids.numel())
 
-        # Initialize tensors to store generated tokens
-        only_answer_ids = torch.empty((batch_size, 0), dtype=torch.long, device=device)
+    comp_ids_all: List[List[int]] = [tokenizer.encode(c, add_special_tokens=False) for c in completions]
+    scores: List[float] = []
 
-        # Track which sequences have finished generating
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    for s in range(0, len(completions), batch_size):
+        chunk_ids = comp_ids_all[s : s + batch_size]
+        bsz = len(chunk_ids)
+        max_comp = max((len(x) for x in chunk_ids), default=0)
+        if max_comp == 0:
+            scores.extend([-1e9] * bsz)
+            continue
 
-        # Record each sample length (number of non-eos tokens)
-        valid_lengths = padded_attention_mask.sum(dim=1).long()
-        batch_indices = torch.arange(batch_size, device=device)
+        total_len = prompt_len + max_comp
+        ids = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
+        att = torch.zeros((bsz, total_len), dtype=torch.long, device=device)
 
-        for _ in range(max_length):
-            max_valid_lengths = max(valid_lengths).item()
-            if max_valid_lengths >= max_length:
-                break  # Stop if any sequence reached max_length
+        # prompt (all valid)
+        ids[:, :prompt_len] = prompt_ids.unsqueeze(0).expand(bsz, -1)
+        att[:, :prompt_len] = 1
 
-            # Forward pass through the model
-            logits = model(video=images, qa_inputs_ids=padded_input_ids[:, :max_valid_lengths], qa_att_mask=padded_attention_mask[:, :max_valid_lengths])
+        # completion (variable valid)
+        for j, toks in enumerate(chunk_ids):
+            L = len(toks)
+            if L == 0:
+                continue
+            ids[j, prompt_len : prompt_len + L] = torch.tensor(toks, dtype=torch.long, device=device)
+            att[j, prompt_len : prompt_len + L] = 1
 
-            # Get next token probabilities and entropy
-            last_valid_logits = logits[batch_indices, valid_lengths - 1, :]
+        vemb = video_embeds_1.expand(bsz, -1, -1).contiguous()
+        vats = video_atts_1.expand(bsz, -1).contiguous()
 
-            # Get next token
-            next_token_ids = torch.argmax(last_valid_logits, dim=-1)
+        logits = _forward_logits(model, ids, att, vemb, vats)  # (B, total_len, vocab)
+        log_soft = torch.log_softmax(logits, dim=-1)
 
-            # Check EOS
-            is_eos = (next_token_ids == tokenizer.eos_token_id)
-            finished = finished | is_eos  # Update finished status
+        for j, toks in enumerate(chunk_ids):
+            lp = 0.0
+            ok = True
+            for k, tok_id in enumerate(toks):
+                pos = prompt_len + k - 1
+                if pos < 0 or pos >= log_soft.size(1):
+                    ok = False
+                    break
+                lp += float(log_soft[j, pos, tok_id].item())
+            scores.append(lp if ok else -1e9)
 
-            padded_input_ids[batch_indices, valid_lengths] = next_token_ids
-            padded_attention_mask[batch_indices, valid_lengths] = 1
-            valid_lengths += 1
+    return scores
 
-            # Append the selected tokens to the generated_ids
-            only_answer_ids = torch.cat([only_answer_ids, next_token_ids.unsqueeze(1)], dim=1)
 
-            # If all sequences have finished, exit early
-            if finished.all():
+def _closed_predict_bool(model, tokenizer, prompt_ids, vemb, vats, device) -> str:
+    """
+    More robust than only YES/NO:
+      positive candidates: YES / TRUE / 1
+      negative candidates: NO / FALSE / 0
+    We take the best-scoring candidate in each group and compare.
+    """
+    pos = [" YES", " True", " TRUE", " 1"]
+    neg = [" NO", " False", " FALSE", " 0"]
+    cands = pos + neg
+    scores = _score_completions_logprob_batched(model, tokenizer, prompt_ids, vemb, vats, cands, device, batch_size=len(cands))
+
+    pos_best = max(scores[:len(pos)])
+    neg_best = max(scores[len(pos):])
+
+    return "YES" if pos_best >= neg_best else "NO"
+
+
+def _closed_predict_choice(model, tokenizer, prompt_ids, vemb, vats, K: int, device) -> str:
+    completions = [f" {i}" for i in range(1, K + 1)]
+    scores = _score_completions_logprob_batched(model, tokenizer, prompt_ids, vemb, vats, completions, device, batch_size=min(32, K))
+    best = int(torch.tensor(scores).argmax().item())
+    return str(best + 1)
+
+
+def _closed_predict_count(model, tokenizer, prompt_ids, vemb, vats, count_max: int, device) -> str:
+    completions = [f" {i}" for i in range(0, count_max + 1)]
+    bs = 64 if (count_max + 1) >= 64 else (count_max + 1)
+    scores = _score_completions_logprob_batched(model, tokenizer, prompt_ids, vemb, vats, completions, device, batch_size=bs)
+    best = int(torch.tensor(scores).argmax().item())
+    return str(best)
+
+
+def _shortlist_labels_by_overlap(labels: List[str], question: str, topk: int = 50) -> List[str]:
+    if topk <= 0 or len(labels) <= topk:
+        return labels
+
+    q = (question or "").lower()
+    q_toks = set(re.findall(r"[a-z0-9_]+", q))
+
+    scored = []
+    for lab in labels:
+        l = lab.lower()
+        l_toks = set(re.findall(r"[a-z0-9_]+", l))
+        inter = len(q_toks & l_toks)
+        bonus = 0
+        if ("before" in q or "after" in q) and ("before" in l or "after" in l):
+            bonus = 1
+        scored.append((inter + bonus, lab))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [lab for _, lab in scored[:topk]]
+
+
+def _closed_predict_vocab_text(model, tokenizer, prompt_ids, vemb, vats, labels: List[str], device) -> str:
+    completions = [(" " + s) if not s.startswith(" ") else s for s in labels]
+    scores = _score_completions_logprob_batched(model, tokenizer, prompt_ids, vemb, vats, completions, device, batch_size=32)
+    best = int(torch.tensor(scores).argmax().item())
+    return labels[best]
+
+
+def batch_decode(
+    images: torch.Tensor,
+    questions: List[str],
+    metas: List[Dict[str, Any]],
+    model,
+    tokenizer,
+    max_prompt_len: int,
+    max_new_tokens: int,
+    device,
+    decode_mode: str = "hybrid",
+    closed_labels: Optional[Dict[str, List[str]]] = None,
+    count_max: int = 20,
+    closed_text_topk: int = 50,
+) -> List[str]:
+    """
+    decode_mode:
+      - greedy: pure greedy generation
+      - closed: ALWAYS closed-decoding for bool/choice/count AND for text categories that exist in vocabs_json
+      - hybrid: greedy first; if output is not parseable / not in label space, fallback to closed-decoding
+    """
+    bsz = images.size(0)
+
+    prompts = [_build_prompt(q, m, closed_labels=closed_labels) for q, m in zip(questions, metas)]
+    tok = tokenizer(
+        prompts,
+        padding=True,
+        truncation=True,
+        max_length=max_prompt_len,
+        return_tensors="pt",
+    )
+    input_ids = tok["input_ids"].to(device)
+    attn_mask = tok["attention_mask"].to(device)
+
+    video_embeds, video_atts = _encode_video_cached(model, images, device)
+
+    total_len = max_prompt_len + max_new_tokens
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    padded_ids = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
+    padded_att = torch.zeros((bsz, total_len), dtype=torch.long, device=device)
+
+    L0 = input_ids.size(1)
+    padded_ids[:, :L0] = input_ids
+    padded_att[:, :L0] = attn_mask
+
+    valid_lens = padded_att.sum(dim=1).long()
+    batch_idx = torch.arange(bsz, device=device)
+
+    only_new = torch.empty((bsz, 0), dtype=torch.long, device=device)
+    finished = torch.zeros(bsz, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            max_valid = int(valid_lens.max().item())
+            if max_valid >= total_len:
                 break
 
-        # Decode the generated tokens into strings
-        generated_ids_cpu = only_answer_ids.cpu().tolist()  # Move to CPU and convert to list for processing
-        for i in range(batch_size):
-            # Find the first occurrence of eos_token_id to truncate the answer
-            try:
-                eos_index = generated_ids_cpu[i].index(tokenizer.eos_token_id)
-                answer_ids = generated_ids_cpu[i][:eos_index]
-            except ValueError:
-                # If eos_token_id is not found, use all generated tokens
-                answer_ids = generated_ids_cpu[i]
+            ids_now = padded_ids[:, :max_valid]
+            att_now = padded_att[:, :max_valid]
 
-            # Decode the token IDs to a string, skipping special tokens
-            answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
-            answers.append(answer)
+            logits = _forward_logits(model, ids_now, att_now, video_embeds, video_atts)
+            next_logits = logits[batch_idx, valid_lens - 1]
+            next_ids = torch.argmax(next_logits, dim=-1)
 
-    return answers
+            if tokenizer.eos_token_id is not None:
+                next_ids = torch.where(finished, torch.tensor(pad_id, device=device), next_ids)
+                finished = finished | (next_ids == tokenizer.eos_token_id)
+
+            padded_ids[batch_idx, valid_lens] = next_ids
+            padded_att[batch_idx, valid_lens] = (~finished).long()
+            valid_lens = valid_lens + (~finished).long()
+
+            only_new = torch.cat([only_new, next_ids.unsqueeze(1)], dim=1)
+            if bool(finished.all()):
+                break
+
+    greedy_texts: List[str] = []
+    for i in range(bsz):
+        seq = only_new[i]
+        toks = seq.tolist()
+        if tokenizer.eos_token_id is not None and tokenizer.eos_token_id in toks:
+            toks = toks[: toks.index(tokenizer.eos_token_id)]
+        greedy_texts.append(tokenizer.decode(toks, skip_special_tokens=True).strip())
+
+    outs: List[str] = []
+    for i in range(bsz):
+        meta = metas[i]
+        q = questions[i]
+        pred = greedy_texts[i]
+
+        lt = _infer_label_type_from_meta(q, meta)
+
+        cat = (meta.get("category") or "").lower().strip()
+        if cat == "phase":
+            cat = "phase_transition"
+
+        K = meta.get("choice_K", None)
+        if K is None:
+            K = _parse_choice_K_from_question(q)
+        choices = meta.get("choices", None)
+        if K is None and isinstance(choices, list):
+            K = len(choices)
+
+        # !!! CRITICAL FIX: per-sample true prompt length (no padding)
+        Li = int(attn_mask[i].sum().item())
+        prompt_ids_1 = input_ids[i, :Li].detach()
+
+        vemb = video_embeds[i : i + 1]
+        vats = video_atts[i : i + 1]
+
+        # ---- BOOL ----
+        if lt == "bool":
+            if decode_mode == "closed":
+                outs.append(_closed_predict_bool(model, tokenizer, prompt_ids_1, vemb, vats, device))
+            else:
+                pb = _parse_bool_pred(pred)
+                if pb is None:
+                    outs.append(_closed_predict_bool(model, tokenizer, prompt_ids_1, vemb, vats, device))
+                else:
+                    outs.append(pred)
+            continue
+
+        # ---- CHOICE ----
+        if lt == "choice_index" or (isinstance(K, int) and K > 0) or (choices is not None):
+            if not isinstance(K, int) or K <= 0:
+                outs.append(pred)
+                continue
+            if decode_mode == "closed":
+                outs.append(_closed_predict_choice(model, tokenizer, prompt_ids_1, vemb, vats, int(K), device))
+            else:
+                m = re.search(r"\b(\d+)\b", pred)
+                if m is None:
+                    outs.append(_closed_predict_choice(model, tokenizer, prompt_ids_1, vemb, vats, int(K), device))
+                else:
+                    pi = int(m.group(1))
+                    if 1 <= pi <= K:
+                        outs.append(pred)
+                    else:
+                        outs.append(_closed_predict_choice(model, tokenizer, prompt_ids_1, vemb, vats, int(K), device))
+            continue
+
+        # ---- COUNT ----
+        if lt == "count":
+            if decode_mode == "closed":
+                outs.append(_closed_predict_count(model, tokenizer, prompt_ids_1, vemb, vats, int(count_max), device))
+            else:
+                m = re.search(r"\b(\d+)\b", pred)
+                if m is None:
+                    outs.append(_closed_predict_count(model, tokenizer, prompt_ids_1, vemb, vats, int(count_max), device))
+                else:
+                    outs.append(pred)
+            continue
+
+        # ---- TEXT (closed-set) ----
+        if closed_labels is not None and cat in closed_labels:
+            labels_full = _labels_for_category(closed_labels, cat)
+            labels = labels_full if labels_full else closed_labels[cat]
+
+            if len(labels) > max(60, closed_text_topk):
+                labels_use = _shortlist_labels_by_overlap(labels, q, topk=int(closed_text_topk))
+            else:
+                labels_use = labels
+
+            if decode_mode == "closed":
+                outs.append(_closed_predict_vocab_text(model, tokenizer, prompt_ids_1, vemb, vats, labels_use, device))
+            else:
+                low = pred.strip().lower()
+                if any(low == lab.strip().lower() for lab in labels_use):
+                    outs.append(pred)
+                else:
+                    outs.append(_closed_predict_vocab_text(model, tokenizer, prompt_ids_1, vemb, vats, labels_use, device))
+            continue
+
+        outs.append(pred)
+
+    return outs
 
 
-def inference(val_loader, model, tokenizer, device, seq_length):
-    """
-    Runs inference over a dataset to generate answers and compute predictions.
+def inference(
+    val_loader,
+    model,
+    tokenizer,
+    device,
+    max_prompt_len: int,
+    max_new_tokens: int,
+    decode_mode: str = "hybrid",
+    vocabs_json: Optional[str] = None,
+    count_max: int = 20,
+    closed_text_topk: int = 50,
+):
+    references: List[Any] = []
+    predictions: List[str] = []
+    metas: List[Dict[str, Any]] = []
 
-    Args:
-        val_loader (DataLoader): DataLoader providing validation batches.
-        model (torch.nn.Module): Trained model for answer generation.
-        tokenizer: Tokenizer for decoding text outputs.
-        device (torch.device): Device used for inference.
-        seq_length (int): Maximum generation length.
-
-    Returns:
-        tuple: (ground_truth_answers, predicted_answers, ground_truth_keywords)
-    """
-    
-    references = []
-    predictions = []
-    keyword_references = []
+    closed_labels = _load_closed_labels(vocabs_json) if vocabs_json else None
 
     model.eval()
     with torch.no_grad():
-        for _, (images, questions, answers, keywords) in enumerate(tqdm(val_loader), 0):
+        for _, (images, questions, answers, batch_metas) in enumerate(tqdm(val_loader), 0):
             images = images.to(device)
-            generated_response = batch_greedy_search(
-                images,
-                questions,
-                model,
-                tokenizer,
-                max_length=seq_length,
-                device=device
+            gen = batch_decode(
+                images=images,
+                questions=questions,
+                metas=batch_metas,
+                model=model,
+                tokenizer=tokenizer,
+                max_prompt_len=max_prompt_len,
+                max_new_tokens=max_new_tokens,
+                device=device,
+                decode_mode=decode_mode,
+                closed_labels=closed_labels,
+                count_max=count_max,
+                closed_text_topk=closed_text_topk,
             )
-
             references.extend(answers)
-            predictions.extend(generated_response)
-            keyword_references.extend(keywords)
+            predictions.extend(gen)
+            metas.extend(batch_metas)
 
-    print("First 5 Labels:", references[:5])
-    print("First 5 Predictions:", predictions[:5])
-    print("First 5 Keywords:", keyword_references[:5])
-
-    return references, predictions, keyword_references
+    print("First 5 GT:", references[:5])
+    print("First 5 Pred:", predictions[:5])
+    print("First 5 Meta:", metas[:5])
+    return references, predictions, metas
