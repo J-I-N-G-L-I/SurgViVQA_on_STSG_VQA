@@ -37,7 +37,7 @@ python evaluation_stsg.py \
   --decode_mode closed \
   --text_vocab_json ${VOCAB_JSON} \
   --count_max 20 \
-  --closed_text_topk 50 \
+  --closed_text_topk 100 \
   --save_dir stsg_eval_outputs_full
 
 # -----------------------------

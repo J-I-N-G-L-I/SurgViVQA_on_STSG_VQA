@@ -320,6 +320,36 @@ def simple_stem(token: str) -> str:
             break
     return t
 
+def canon_ordering_text(s: Any) -> str:
+    """
+    Canonicalize ordering text so that semantically equivalent forms map to the same vocab label.
+    - Normalize common synonyms to "before/after"
+    - Convert "A after B" -> "B before A" (better matching your ordering vocab that uses "before")
+    """
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+
+    x = s.strip().lower()
+
+    # unify whitespace
+    x = re.sub(r"\s+", " ", x)
+
+    # synonym normalization
+    x = x.replace("prior to", "before").replace("earlier than", "before").replace("precede", "before")
+    x = x.replace("later than", "after").replace("subsequent to", "after").replace("follow", "after")
+
+    # Convert: A after B  ->  B before A
+    # Only do this when "before" is not already present to avoid weird double forms.
+    if " after " in x and " before " not in x:
+        parts = x.split(" after ", 1)
+        if len(parts) == 2:
+            a, b = parts[0].strip(), parts[1].strip()
+            if a and b:
+                x = f"{b} before {a}"
+
+    return x
 
 def normalize_for_vocab_text(s: Any) -> str:
     if not isinstance(s, str):
@@ -410,6 +440,11 @@ class VocabMapper:
 
     def encode_gt(self, category: str, label: Any) -> int:
         key = self._canon_category_name(category)
+
+        # category-specific canonicalization BEFORE normalization
+        if key == "ordering":
+            label = canon_ordering_text(label)
+
         norm = normalize_for_vocab_text(label)
         if key in self.vocabs:
             return self.norm2id[key].get(norm, 0)
@@ -417,11 +452,17 @@ class VocabMapper:
 
     def encode_pred(self, category: str, label: Any) -> int:
         key = self._canon_category_name(category)
+
+        # category-specific canonicalization BEFORE normalization
+        if key == "ordering":
+            label = canon_ordering_text(label)
+
         norm = normalize_for_vocab_text(label)
         if key in self.vocabs:
             id_map = self.norm2id[key]
             tok_map = self.id2tokens[key]
 
+            # 1) exact normalized match
             if norm in id_map:
                 return id_map[norm]
 
@@ -452,9 +493,11 @@ class VocabMapper:
                     best_jacc = jacc
                     best_jacc_idx = idx
 
+            # 2) full coverage of label tokens
             if best_full_cover >= 1.0:
                 return best_full_idx
 
+            # 3) fallback by jaccard threshold (ordering a bit looser)
             min_jacc = 0.5
             if key == "ordering":
                 min_jacc = 0.4
@@ -564,23 +607,6 @@ def evaluate_stsg(
 
         label_type = _infer_label_type(meta, gt_answer)
         pred_text = extract_final_answer(pred_text_raw)
-        def _canon_ordering_text(s: str) -> str:
-            if not isinstance(s, str):
-                s = str(s)
-            x = s.strip().lower()
-
-            # 常见同义词归一
-            x = x.replace("prior to", "before").replace("earlier than", "before").replace("precede", "before")
-            x = x.replace("later than", "after").replace("subsequent to", "after").replace("follow", "after")
-
-            # 如果是 A after B -> 转成 B before A（尽量匹配你的 vocab）
-            if " after " in x and " before " not in x:
-                parts = x.split(" after ")
-                if len(parts) == 2:
-                    a, b = parts[0].strip(), parts[1].strip()
-                    if a and b:
-                        return f"{b} before {a}"
-            return s
 
         # ---- BOOL ----
         if label_type == "bool":
@@ -718,8 +744,6 @@ def evaluate_stsg(
             by_category["boundary"]["cat"].add(gt_id, pred_id)
             task_hist["boundary_text"] += 1
         elif category == "ordering":
-            gt_answer = _canon_ordering_text(gt_answer)
-            pred_text = _canon_ordering_text(pred_text)
             by_category["ordering"]["cat"].add(gt_id, pred_id)
             task_hist["ordering_text"] += 1
         elif category == "phase_transition":
@@ -747,17 +771,17 @@ def evaluate_stsg(
     dur["type"] = "duration"
 
     ex_bool = by_category["extreme"]["bool"].finalize()
-    ex_cat = by_category["extreme"]["cat"].finalize_basic()
+    ex_cat = by_category["extreme"]["cat"].finalize_with_macro_f1()
     ex_sec = by_category["extreme"]["seconds"].finalize()
 
     mo_cat = by_category["motion"]["cat"].finalize_with_macro_f1()
 
     od_bool = by_category["ordering"]["bool"].finalize()
-    od_cat = by_category["ordering"]["cat"].finalize_basic()
+    od_cat = by_category["ordering"]["cat"].finalize_with_macro_f1()
     od_choice = by_category["ordering"]["choice"].finalize_basic()
 
     ph_bool = by_category["phase_transition"]["bool"].finalize()
-    ph_cat = by_category["phase_transition"]["cat"].finalize_basic()
+    ph_cat = by_category["phase_transition"]["cat"].finalize_with_macro_f1()
     ph_sec = by_category["phase_transition"]["seconds"].finalize()
     ph_choice = by_category["phase_transition"]["choice"].finalize_basic()
 

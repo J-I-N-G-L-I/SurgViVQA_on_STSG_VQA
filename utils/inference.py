@@ -129,7 +129,14 @@ def _build_prompt(question: str, meta: Dict[str, Any], closed_labels: Optional[D
             if len(lbls) <= 60:
                 instr = "Answer with exactly one label from: " + ", ".join(lbls) + "."
             else:
-                instr = "Answer with a short phrase."
+                if cat == "ordering":
+                    instr = (
+                        "Answer with ONLY the final label/phrase.\n"
+                        "If your answer expresses temporal order, use the exact format: '<event1> before <event2>'.\n"
+                        "Do NOT use the word 'after'. Do NOT add explanation or punctuation." 
+                    )
+                else:
+                    instr = "Answer with a short phrase."
         elif cat == "motion":
             instr = (
                 "Answer with exactly one label from: "
@@ -194,7 +201,12 @@ def _score_completions_logprob_batched(
     completions: List[str],
     device,
     batch_size: int = 32,
+    length_penalty_alpha: float = 1.0,  # 1.0 ~= mean logprob; 0.0 ~= sum logprob
 ) -> List[float]:
+    """
+    Score each completion by (sum logprob) / (len(tokens) ** alpha)
+    This reduces the strong bias toward short labels in closed-set decoding.
+    """
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     prompt_len = int(prompt_ids.numel())
 
@@ -202,7 +214,7 @@ def _score_completions_logprob_batched(
     scores: List[float] = []
 
     for s in range(0, len(completions), batch_size):
-        chunk_ids = comp_ids_all[s : s + batch_size]
+        chunk_ids = comp_ids_all[s: s + batch_size]
         bsz = len(chunk_ids)
         max_comp = max((len(x) for x in chunk_ids), default=0)
         if max_comp == 0:
@@ -222,8 +234,8 @@ def _score_completions_logprob_batched(
             L = len(toks)
             if L == 0:
                 continue
-            ids[j, prompt_len : prompt_len + L] = torch.tensor(toks, dtype=torch.long, device=device)
-            att[j, prompt_len : prompt_len + L] = 1
+            ids[j, prompt_len: prompt_len + L] = torch.tensor(toks, dtype=torch.long, device=device)
+            att[j, prompt_len: prompt_len + L] = 1
 
         vemb = video_embeds_1.expand(bsz, -1, -1).contiguous()
         vats = video_atts_1.expand(bsz, -1).contiguous()
@@ -234,13 +246,24 @@ def _score_completions_logprob_batched(
         for j, toks in enumerate(chunk_ids):
             lp = 0.0
             ok = True
+            L = len(toks)
+            if L == 0:
+                scores.append(-1e9)
+                continue
+
             for k, tok_id in enumerate(toks):
                 pos = prompt_len + k - 1
                 if pos < 0 or pos >= log_soft.size(1):
                     ok = False
                     break
                 lp += float(log_soft[j, pos, tok_id].item())
-            scores.append(lp if ok else -1e9)
+
+            if not ok:
+                scores.append(-1e9)
+                continue
+
+            denom = float(max(1, L)) ** float(length_penalty_alpha)
+            scores.append(lp / denom)
 
     return scores
 
@@ -279,8 +302,16 @@ def _closed_predict_count(model, tokenizer, prompt_ids, vemb, vats, count_max: i
 
 
 def _shortlist_labels_by_overlap(labels: List[str], question: str, topk: int = 50) -> List[str]:
+    """
+    Token-overlap shortlist.
+    For large label spaces (e.g., ordering), enforce a larger minimum topk to avoid missing the GT label too often.
+    """
     if topk <= 0 or len(labels) <= topk:
         return labels
+
+    # safety: if label space is large, don't use a tiny topk
+    if len(labels) >= 300 and topk < 150:
+        topk = 150
 
     q = (question or "").lower()
     q_toks = set(re.findall(r"[a-z0-9_]+", q))
