@@ -33,7 +33,7 @@ python evaluation_stsg.py \
   --checkpoint /mnt/scratch/sc232jl/SurgViVQA/checkpoints/surgvivqa_gpt2_endovis_ckpt/best_model.pth \
   --batch_size 2 --workers 6 \
   --num_frames 16 \
-  --max_prompt_len 128 --max_new_tokens 16 \
+  --max_prompt_len 512 --max_new_tokens 16 \
   --decode_mode closed \
   --text_vocab_json ${VOCAB_JSON} \
   --count_max 20 \
