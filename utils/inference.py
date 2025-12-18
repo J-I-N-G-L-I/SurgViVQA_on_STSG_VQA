@@ -203,19 +203,32 @@ def _build_prompt(question: str, meta: Dict[str, Any], closed_labels: Optional[D
     return prompt
 
 
-def _forward_logits(model, input_ids, attention_mask, video_embeds, video_atts):
+def _forward_logits(model, input_ids, attention_mask, video_embeds, video_atts, video=None):
     """
-    Unified forward wrapper. Your model is expected to accept:
-      - input_ids, attention_mask
-      - video_embeds, video_atts
-    and return logits over vocab.
+    SurgViVQA forward signature (from your model.py):
+      forward(video, qa_inputs_ids, qa_att_mask, video_embeds=None, video_atts=None)
+    Return: logits tensor [B, L, vocab]
     """
-    out = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        video_embeds=video_embeds,
-        video_atts=video_atts,
-    )
+    # Prefer calling SurgViVQA-style forward
+    try:
+        out = model(
+            video,                    # can be None if video_embeds/video_atts are provided
+            input_ids,
+            attention_mask,
+            video_embeds=video_embeds,
+            video_atts=video_atts,
+        )
+    except TypeError:
+        # Fallback: try keyword names that match SurgViVQA.forward
+        out = model(
+            video=video,
+            qa_inputs_ids=input_ids,
+            qa_att_mask=attention_mask,
+            video_embeds=video_embeds,
+            video_atts=video_atts,
+        )
+
+    # Some models return dict/obj; SurgViVQA returns logits directly (Tensor)
     if isinstance(out, dict) and "logits" in out:
         return out["logits"]
     if hasattr(out, "logits"):
@@ -275,7 +288,7 @@ def _score_completions_logprob_batched(
         vemb = video_embeds_1.expand(bsz, -1, -1).contiguous()
         vats = video_atts_1.expand(bsz, -1).contiguous()
 
-        logits = _forward_logits(model, ids, att, vemb, vats)  # (B, total_len, vocab)
+        logits = _forward_logits(model, ids, att, vemb, vats, video=None)  # (B, total_len, vocab)
         log_soft = torch.log_softmax(logits, dim=-1)
 
         for j, toks in enumerate(chunk_ids):
@@ -522,7 +535,7 @@ def batch_decode(
             ids_now = padded_ids[:, :max_valid]
             att_now = padded_att[:, :max_valid]
 
-            logits = _forward_logits(model, ids_now, att_now, video_embeds, video_atts)
+            logits = _forward_logits(model, ids_now, att_now, video_embeds, video_atts, video=None)
             next_logits = logits[batch_idx, valid_lens - 1]
             next_ids = torch.argmax(next_logits, dim=-1)
 

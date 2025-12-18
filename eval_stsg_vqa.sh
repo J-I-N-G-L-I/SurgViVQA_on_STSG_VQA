@@ -38,7 +38,7 @@ python evaluation_stsg.py \
   --text_vocab_json ${VOCAB_JSON} \
   --count_max 20 \
   --closed_text_topk 100 \
-  --save_dir stsg_eval_outputs_full
+  --save_dir stsg_eval_outputs_full_new
 
 # -----------------------------
 # When you want to test WITH rationale later, uncomment:
