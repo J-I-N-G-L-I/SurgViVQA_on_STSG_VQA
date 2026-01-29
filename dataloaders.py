@@ -182,6 +182,7 @@ class STSGTemporalVideoQA(Dataset):
         include_rationale: bool = False,
         rationale_key: str = "auto",
         force_mode: str = "",
+        append_rationale_to_question: bool = False,
     ):
         self.video_ids = video_ids
         self.stsg_qa_root = stsg_qa_root
@@ -227,6 +228,8 @@ class STSGTemporalVideoQA(Dataset):
 
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
+        
+        self.append_rationale_to_question = append_rationale_to_question
 
     def __len__(self):
         return len(self.samples)
@@ -283,6 +286,21 @@ class STSGTemporalVideoQA(Dataset):
 
         # auto：优先按类别找 e.g. rationale_duration_v1_en
         c = (category or "").lower()
+        cat2key = {
+            "count": "rationale_count_v1_en",
+            "duration": "rationale_duration_v1_en",
+            "motion": "rationale_motion_v1_en",
+            "ordering": "rationale_ordering_v1_en",
+            "extreme": "rationale_extreme_v1_en",
+            "concurrency": "rationale_concurrency_v1_en",
+            "boundary": "rationale_boundary_v1_en",
+            "phase_transition": "rationale_phase_transition_v1_en",
+            "phase": "rationale_phase_transition_v1_en",
+        }
+        k0 = cat2key.get(c, None)
+        if k0 and k0 in raw:
+            return raw[k0]
+    
         cand = [
             f"rationale_{c}_v1_en",
             f"rationale_{c}_en",
@@ -472,7 +490,19 @@ class STSGTemporalVideoQA(Dataset):
             "choices": raw.get("choices") or raw.get("options") or raw.get("choice_candidates") or None,
             "qa_raw": raw,
         }
-        return video_tensor, s["question"], s["answer"], meta
+        
+        q = s.get("question", "")
+        if q is None:
+            q = ""
+        q = str(q)
+        # add rationale
+        if self.include_rationale and self.append_rationale_to_question and isinstance(rationale, str) and rationale.strip():
+            q = q.rstrip() + "\nRationale:\n" + rationale.strip()
+            meta["rationale_appended"] = True
+        else:
+            meta["rationale_appended"] = False
+
+        return video_tensor, q, s["answer"], meta
 
 
 def collate_stsg(batch):

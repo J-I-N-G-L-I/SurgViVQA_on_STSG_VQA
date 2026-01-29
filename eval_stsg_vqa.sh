@@ -12,6 +12,7 @@ set -e
 mkdir -p logs
 
 source ~/.bashrc
+module load miniforge
 conda activate SurgViVQAEnv
 
 cd /mnt/scratch/sc232jl/SurgViVQA
@@ -21,7 +22,6 @@ export TRANSFORMERS_CACHE=/scratch/sc232jl/hf_cache
 export TORCH_HOME=/scratch/sc232jl/torch_cache
 export TOKENIZERS_PARALLELISM=false
 
-# >>> IMPORTANT <<<
 # Save your uploaded vocab JSON (pasted.txt content) to a real .json file, e.g.:
 # /mnt/scratch/sc232jl/SurgViVQA/vocabs/stsg_text_vocab.json
 VOCAB_JSON=/users/sc232jl/SSGVQANet_hybrid_training_pro_with_rationale/utils/vocabs_train.json
@@ -33,12 +33,14 @@ python evaluation_stsg.py \
   --checkpoint /mnt/scratch/sc232jl/SurgViVQA/checkpoints/surgvivqa_gpt2_endovis_ckpt/best_model.pth \
   --batch_size 2 --workers 6 \
   --num_frames 16 \
-  --max_prompt_len 512 --max_new_tokens 16 \
+  --max_prompt_len 1024 --max_new_tokens 16 \
+  --include_rationale --rationale_key auto --append_rationale_to_question \
   --decode_mode closed \
+  --strict_answer_format \
   --text_vocab_json ${VOCAB_JSON} \
   --count_max 20 \
   --closed_text_topk 100 \
-  --save_dir stsg_eval_outputs_full_new
+  --save_dir stsg_eval_outputs_full_add_rationale_1024
 
 # -----------------------------
 # When you want to test WITH rationale later, uncomment:

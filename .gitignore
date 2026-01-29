@@ -16,6 +16,9 @@ hf_models/
 logs/
 REAL-Colon-VQA_annotations/
 stsg_eval_outputs_full/
+stsg_eval_outputs_full_add_rationale/
+stsg_eval_outputs_full_add_rationale_1024/
+stsg_eval_outputs_full_new/
 SurgViVQA_checkpoint/
 
 # visual envs

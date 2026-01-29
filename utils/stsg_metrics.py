@@ -8,135 +8,37 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+
+# ----------------------
 # basic metrics utils
+# ----------------------
 
 def safe_div(a: float, b: float) -> float:
     return float(a) / float(b) if b != 0 else 0.0
 
 
-def bin_acc(y_true: List[int], y_pred: List[int]) -> float:
-    if not y_true:
-        return 0.0
-    return float(np.mean(np.array(y_true) == np.array(y_pred)))
-
-
-def precision_recall_f1(y_true: List[int], y_pred: List[int]) -> Tuple[float, float, float]:
-    if not y_true:
-        return 0.0, 0.0, 0.0
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-    tp = float(((y_true == 1) & (y_pred == 1)).sum())
-    fp = float(((y_true == 0) & (y_pred == 1)).sum())
-    fn = float(((y_true == 1) & (y_pred == 0)).sum())
-    prec = safe_div(tp, tp + fp)
-    rec = safe_div(tp, tp + fn)
-    f1 = safe_div(2 * prec * rec, prec + rec)
-    return prec, rec, f1
-
-
-def auroc_from_scores(y_true: List[int], y_score: List[float]) -> float:
-    if not y_true:
-        return 0.5
-    y_true = np.array(y_true, dtype=np.int32)
-    y_score = np.array(y_score, dtype=np.float32)
-
-    if y_true.min() == y_true.max():
-        return 0.5
-
-    order = np.argsort(-y_score)
-    y_sorted = y_true[order]
-    score_sorted = y_score[order]
-
-    P = float((y_true == 1).sum())
-    N = float((y_true == 0).sum())
-
-    tp_cum = 0.0
-    fp_cum = 0.0
-    prev = None
-    auc = 0.0
-    tpr_prev = 0.0
-    fpr_prev = 0.0
-
-    for yi, si in zip(y_sorted, score_sorted):
-        if prev is None:
-            prev = si
-        if si != prev:
-            tpr = safe_div(tp_cum, P)
-            fpr = safe_div(fp_cum, N)
-            auc += (fpr - fpr_prev) * (tpr + tpr_prev) / 2.0
-            tpr_prev = tpr
-            fpr_prev = fpr
-            prev = si
-        if yi == 1:
-            tp_cum += 1.0
-        else:
-            fp_cum += 1.0
-
-    tpr = safe_div(tp_cum, P)
-    fpr = safe_div(fp_cum, N)
-    auc += (fpr - fpr_prev) * (tpr + tpr_prev) / 2.0
-    return float(auc)
+def softmax(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.sum(e)
 
 
 # ----------------------
-# parsing utilities
+# parsing helpers
 # ----------------------
 
-def extract_final_answer(text: Any) -> str:
-    if text is None:
-        return ""
-    if not isinstance(text, str):
-        text = str(text)
-    s = text
-
-    if "FINAL_ANSWER:" in s:
-        s = s.split("FINAL_ANSWER:", 1)[-1]
-
-    s = s.strip()
-    s = re.sub(r"^[\s:;\-\>\(\)\[\]\{\}]+", "", s)
-    s = s.strip()
-
-    # Keep only first line (many models append extra stuff)
-    if "\n" in s:
-        s = s.split("\n", 1)[0].strip()
-
-    # Remove trailing punctuation
-    s = s.strip().strip(" .,:;")
-    return s
-
-
-def parse_bool_label(x: Any) -> Optional[int]:
-    if x is None:
+def _parse_choice_K_from_question(q: str) -> Optional[int]:
+    """
+    Parse choice option range K from question templates like:
+      - "Answer with a number 1-5"
+      - "Reply 1-3"
+      - "Answer 1-4"
+    Return K as int, or None.
+    """
+    if not q:
         return None
-    if isinstance(x, bool):
-        return 1 if x else 0
-    s = str(x).strip().lower()
-    if s in ("1", "true", "yes", "y", "t"):
-        return 1
-    if s in ("0", "false", "no", "n", "f"):
-        return 0
-    return None
-
-
-def parse_bool_text(pred: str) -> Optional[int]:
-    if pred is None:
-        return None
-    s = str(pred).strip().lower()
-    if any(k in s for k in ["yes", "true"]):
-        return 1
-    if any(k in s for k in ["no", "false"]):
-        return 0
-    if re.search(r"\b1\b", s):
-        return 1
-    if re.search(r"\b0\b", s):
-        return 0
-    return None
-
-
-def extract_first_int(pred: str) -> Optional[int]:
-    if pred is None:
-        return None
-    m = re.search(r"[-+]?\b(\d+)\b", str(pred))
+    qq = str(q).strip().lower()
+    m = re.search(r"(?:answer|reply)\s*(?:with\s*(?:a\s*)?number\s*)?1\s*(?:\-|–|to)\s*(\d+)\b", qq)
     if not m:
         return None
     try:
@@ -145,14 +47,84 @@ def extract_first_int(pred: str) -> Optional[int]:
         return None
 
 
-def extract_first_number(pred: str) -> Optional[float]:
-    if pred is None:
+def extract_final_answer(text: str) -> str:
+    """
+    Extract answer text from model output.
+    Common patterns:
+      - "Answer: xxx"
+      - "Final answer: xxx"
+      - "xxx"
+    """
+    if text is None:
+        return ""
+    s = str(text).strip()
+
+    # take last line if multiple
+    if "\n" in s:
+        s = s.splitlines()[-1].strip()
+
+    # strip common prefixes
+    s_low = s.lower()
+    for pref in ("final answer:", "answer:", "ans:", "output:", "prediction:"):
+        if s_low.startswith(pref):
+            s = s[len(pref) :].strip()
+            break
+    return s
+
+
+def parse_bool_text(text: str) -> Optional[int]:
+    if text is None:
         return None
-    m = re.search(r"[-+]?\d+(?:\.\d+)?", str(pred))
+    s = str(text).strip().lower()
+    s = s.strip(".!?,")
+
+    # strict
+    if s in ("yes", "true", "y", "t"):
+        return 1
+    if s in ("no", "false", "n", "f"):
+        return 0
+
+    # tolerant: look for tokens
+    if re.search(r"\b(yes|true)\b", s):
+        return 1
+    if re.search(r"\b(no|false)\b", s):
+        return 0
+    return None
+
+
+def parse_bool_label(x: Any) -> Optional[int]:
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return 1 if x else 0
+    s = str(x).strip().lower()
+    if s in ("1", "true", "yes"):
+        return 1
+    if s in ("0", "false", "no"):
+        return 0
+    return None
+
+
+def extract_first_int(text: str) -> Optional[int]:
+    if text is None:
+        return None
+    m = re.search(r"[-+]?\b(\d+)\b", str(text))
     if not m:
         return None
     try:
-        return float(m.group(0))
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def extract_first_float(text: str) -> Optional[float]:
+    if text is None:
+        return None
+    m = re.search(r"[-+]?\b(\d+(?:\.\d+)?)\b", str(text))
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
     except Exception:
         return None
 
@@ -160,272 +132,260 @@ def extract_first_number(pred: str) -> Optional[float]:
 def parse_numeric_gt(x: Any) -> Optional[float]:
     if x is None:
         return None
-    if isinstance(x, (int, float)):
+    if isinstance(x, (int, float, np.integer, np.floating)):
         return float(x)
     s = str(x).strip()
-    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
-    if not m:
-        return None
     try:
-        return float(m.group(0))
+        return float(s)
     except Exception:
-        return None
-
-
-def normalize_for_vocab_text(s: Any) -> str:
-    """
-    Normalize text for vocab lookup / fuzzy matching.
-    - lower
-    - replace separators
-    - remove punctuation
-    - collapse spaces
-    """
-    if s is None:
-        return ""
-    if not isinstance(s, str):
-        s = str(s)
-    x = s.strip().lower()
-    x = x.replace("-", " ").replace("_", " ")
-    x = re.sub(r"[^a-z0-9\s]", " ", x)
-    x = re.sub(r"\s+", " ", x).strip()
-    return x
-
-
-def canon_ordering_text(s: Any) -> str:
-    """
-    Canonicalize ordering text into the vocab-preferred form: 'A before B'.
-
-    - Maps common synonyms to 'before' / 'after'
-    - Converts 'A after B' -> 'B before A'
-    - Normalizes whitespace
-    """
-    if s is None:
-        return ""
-    if not isinstance(s, str):
-        s = str(s)
-
-    x = s.strip().lower()
-    x = re.sub(r"\s+", " ", x)
-
-    x = x.replace("prior to", "before").replace("earlier than", "before").replace("precede", "before")
-    x = x.replace("later than", "after").replace("subsequent to", "after").replace("follow", "after")
-
-    if " after " in x and " before " not in x:
-        parts = x.split(" after ")
-        if len(parts) == 2:
-            a, b = parts[0].strip(), parts[1].strip()
-            if a and b:
-                x = f"{b} before {a}"
-
-    return x
+        # try extract
+        return extract_first_float(s)
 
 
 # ----------------------
-# label encoder & vocab mapper
-# ----------------------
-
-class LabelEncoder:
-    def __init__(self):
-        self._map: Dict[str, int] = {}
-        self._next = 0
-
-    def encode(self, s: str) -> int:
-        if s not in self._map:
-            self._map[s] = self._next
-            self._next += 1
-        return self._map[s]
-
-
-class VocabMapper:
-    def __init__(self, vocabs_json: str):
-        with open(vocabs_json, "r", encoding="utf-8") as f:
-            voc = json.load(f)
-
-        self.vocabs: Dict[str, List[str]] = {}
-        self.norm2id: Dict[str, Dict[str, int]] = {}
-        self.id2norm: Dict[str, Dict[int, str]] = {}
-        self.label_tokens: Dict[str, List[set]] = {}
-
-        for k, arr in voc.items():
-            if not isinstance(arr, list):
-                continue
-            cat = str(k).lower()
-            labels = [str(x) for x in arr]
-            self.vocabs[cat] = labels
-
-            m = {}
-            r = {}
-            tok_sets = []
-            for i, lab in enumerate(labels):
-                nl = normalize_for_vocab_text(lab)
-                m[nl] = i
-                r[i] = nl
-                tok_sets.append(set(nl.split()))
-            self.norm2id[cat] = m
-            self.id2norm[cat] = r
-            self.label_tokens[cat] = tok_sets
-
-    def encode_gt(self, category: str, gt: str) -> int:
-        cat = category.lower()
-        nl = normalize_for_vocab_text(gt)
-        return int(self.norm2id.get(cat, {}).get(nl, 0))
-
-    def encode_pred(self, category: str, pred: str) -> int:
-        cat = category.lower()
-        nl = normalize_for_vocab_text(pred)
-        m = self.norm2id.get(cat, {})
-        if nl in m:
-            return int(m[nl])
-
-        # fuzzy matching (token coverage / jaccard)
-        pred_toks = set(nl.split())
-        if not pred_toks:
-            return 0
-
-        tok_sets = self.label_tokens.get(cat, [])
-        best_i = -1
-        best_jacc = -1.0
-
-        for i, lab_toks in enumerate(tok_sets):
-            if not lab_toks:
-                continue
-            cover = safe_div(len(lab_toks & pred_toks), len(lab_toks))
-            if cover >= 1.0:
-                return i
-            inter = len(lab_toks & pred_toks)
-            union = len(lab_toks | pred_toks)
-            jacc = safe_div(inter, union)
-            if jacc > best_jacc:
-                best_jacc = jacc
-                best_i = i
-
-        thr = 0.4 if cat == "ordering" else 0.5
-        if best_i >= 0 and best_jacc >= thr:
-            return int(best_i)
-        return 0
-
-
-# ----------------------
-# aggregators
+# aggregator classes
 # ----------------------
 
 class BinAgg:
     def __init__(self):
         self.y_true: List[int] = []
         self.y_pred: List[int] = []
-        self.y_score: List[float] = []
+        self.y_score_pos: List[float] = []  # probability/score for positive class if available
 
     def add(self, gt: int, pred: int, score_pos: float):
         self.y_true.append(int(gt))
         self.y_pred.append(int(pred))
-        self.y_score.append(float(score_pos))
+        self.y_score_pos.append(float(score_pos))
 
-    def summarize(self) -> Dict[str, Any]:
-        acc = bin_acc(self.y_true, self.y_pred)
-        prec, rec, f1 = precision_recall_f1(self.y_true, self.y_pred)
-        auroc = auroc_from_scores(self.y_true, self.y_score)
-        return {"acc": acc, "precision": prec, "recall": rec, "f1": f1, "auroc": auroc, "n": len(self.y_true), "type": "bool"}
+    def compute(self) -> Dict[str, Any]:
+        if not self.y_true:
+            return {"n": 0, "type": "bool", "acc": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "auroc": 0.0}
+
+        y_true = np.array(self.y_true, dtype=np.int32)
+        y_pred = np.array(self.y_pred, dtype=np.int32)
+        acc = float(np.mean(y_true == y_pred))
+
+        # precision/recall/f1 on positive class
+        tp = float(np.sum((y_true == 1) & (y_pred == 1)))
+        fp = float(np.sum((y_true == 0) & (y_pred == 1)))
+        fn = float(np.sum((y_true == 1) & (y_pred == 0)))
+        precision = safe_div(tp, tp + fp)
+        recall = safe_div(tp, tp + fn)
+        f1 = safe_div(2 * precision * recall, precision + recall)
+
+        # AUROC (if score exists)
+        y_score = np.array(self.y_score_pos, dtype=np.float32)
+        auroc = _binary_auroc(y_true, y_score)
+
+        return {
+            "n": int(len(y_true)),
+            "type": "bool",
+            "acc": acc,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "auroc": auroc,
+        }
+
+
+def _binary_auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    # degenerate
+    if y_true.size == 0:
+        return 0.0
+    if np.all(y_true == 0) or np.all(y_true == 1):
+        return 0.5
+
+    # rank-based AUROC
+    order = np.argsort(y_score)
+    y = y_true[order]
+    n_pos = float(np.sum(y == 1))
+    n_neg = float(np.sum(y == 0))
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    # compute rank sum for positives
+    ranks = np.arange(1, y.size + 1, dtype=np.float64)
+    rank_sum_pos = float(np.sum(ranks[y == 1]))
+    auc = (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(auc)
 
 
 class CatAgg:
     def __init__(self):
-        self.y_true: List[int] = []
-        self.y_pred: List[int] = []
+        self.gt: List[int] = []
+        self.pred: List[int] = []
+        self.num_classes: int = 0
 
     def add(self, gt: int, pred: int):
-        self.y_true.append(int(gt))
-        self.y_pred.append(int(pred))
+        self.gt.append(int(gt))
+        self.pred.append(int(pred))
+        self.num_classes = max(self.num_classes, int(gt) + 1, int(pred) + 1)
 
-    def summarize(self) -> Dict[str, Any]:
-        if not self.y_true:
-            return {"top1_acc": 0.0, "top3_acc": 0.0, "macro_f1": 0.0, "n": 0, "type": "cat"}
-        y_true = np.array(self.y_true)
-        y_pred = np.array(self.y_pred)
-        top1 = float(np.mean(y_true == y_pred))
+    def compute(self) -> Dict[str, Any]:
+        if not self.gt:
+            return {"n": 0, "type": "cat", "top1_acc": 0.0, "top3_acc": 0.0, "macro_f1": 0.0}
 
-        # macro-f1
-        labels = np.unique(np.concatenate([y_true, y_pred]))
-        f1s = []
-        for lab in labels:
-            yt = (y_true == lab).astype(np.int32)
-            yp = (y_pred == lab).astype(np.int32)
-            tp = float(((yt == 1) & (yp == 1)).sum())
-            fp = float(((yt == 0) & (yp == 1)).sum())
-            fn = float(((yt == 1) & (yp == 0)).sum())
-            prec = safe_div(tp, tp + fp)
-            rec = safe_div(tp, tp + fn)
-            f1 = safe_div(2 * prec * rec, prec + rec)
-            f1s.append(f1)
-        macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+        gt = np.array(self.gt, dtype=np.int32)
+        pred = np.array(self.pred, dtype=np.int32)
+        top1 = float(np.mean(gt == pred))
 
-        return {"top1_acc": top1, "top3_acc": top1, "macro_f1": macro_f1, "n": len(self.y_true), "type": "cat"}
+        # we don't have ranked list here; top3==top1
+        top3 = top1
+
+        macro_f1 = _macro_f1(gt, pred, self.num_classes)
+
+        return {
+            "n": int(len(gt)),
+            "type": "cat",
+            "top1_acc": top1,
+            "top3_acc": top3,
+            "macro_f1": macro_f1,
+        }
+
+
+def _macro_f1(y_true: np.ndarray, y_pred: np.ndarray, num_classes: int) -> float:
+    if y_true.size == 0:
+        return 0.0
+    f1s: List[float] = []
+    for c in range(num_classes):
+        tp = float(np.sum((y_true == c) & (y_pred == c)))
+        fp = float(np.sum((y_true != c) & (y_pred == c)))
+        fn = float(np.sum((y_true == c) & (y_pred != c)))
+        p = safe_div(tp, tp + fp)
+        r = safe_div(tp, tp + fn)
+        f1 = safe_div(2 * p * r, p + r)
+        f1s.append(f1)
+    return float(np.mean(f1s)) if f1s else 0.0
+
+
+class SecAgg:
+    def __init__(self):
+        self.gt: List[float] = []
+        self.pred: List[float] = []
+
+    def add(self, gt: float, pred: float):
+        self.gt.append(float(gt))
+        self.pred.append(float(pred))
+
+    def compute(self) -> Dict[str, Any]:
+        if not self.gt:
+            return {"n": 0, "type": "seconds", "mae": 0.0, "rmse": 0.0, "nmae_gt": 0.0, "within_tau": {}}
+
+        gt = np.array(self.gt, dtype=np.float32)
+        pred = np.array(self.pred, dtype=np.float32)
+        err = np.abs(pred - gt)
+        mae = float(np.mean(err))
+        rmse = float(np.sqrt(np.mean((pred - gt) ** 2)))
+
+        # normalized MAE by gt (avoid div by 0)
+        denom = np.maximum(np.abs(gt), 1e-6)
+        nmae = float(np.mean(err / denom))
+
+        # within tolerance thresholds (seconds)
+        taus = [1.0, 2.0, 5.0]
+        within = {str(t): float(np.mean(err <= t)) for t in taus}
+
+        return {
+            "n": int(len(gt)),
+            "type": "seconds",
+            "mae": mae,
+            "rmse": rmse,
+            "nmae_gt": nmae,
+            "within_tau": within,
+        }
 
 
 class CountAgg:
     def __init__(self):
-        self.gts: List[int] = []
-        self.preds: List[int] = []
+        self.gt: List[int] = []
+        self.pred: List[int] = []
+        self.num_classes: int = 0
 
     def add(self, gt: int, pred: int):
-        self.gts.append(int(gt))
-        self.preds.append(int(pred))
+        self.gt.append(int(gt))
+        self.pred.append(int(pred))
+        self.num_classes = max(self.num_classes, int(gt) + 1, int(pred) + 1)
 
-    def summarize(self) -> Dict[str, Any]:
-        if not self.gts:
-            return {"top1_acc": 0.0, "within1_acc": 0.0, "macro_f1": 0.0, "top3_acc": 0.0, "n": 0, "type": "count"}
-        gt = np.array(self.gts)
-        pr = np.array(self.preds)
-        top1 = float(np.mean(gt == pr))
-        within1 = float(np.mean(np.abs(gt - pr) <= 1))
+    def compute(self) -> Dict[str, Any]:
+        if not self.gt:
+            return {"n": 0, "type": "count", "top1_acc": 0.0, "top3_acc": 0.0, "within1_acc": 0.0, "macro_f1": 0.0}
 
-        labels = np.unique(np.concatenate([gt, pr]))
-        f1s = []
-        for lab in labels:
-            yt = (gt == lab).astype(np.int32)
-            yp = (pr == lab).astype(np.int32)
-            tp = float(((yt == 1) & (yp == 1)).sum())
-            fp = float(((yt == 0) & (yp == 1)).sum())
-            fn = float(((yt == 1) & (yp == 0)).sum())
-            prec = safe_div(tp, tp + fp)
-            rec = safe_div(tp, tp + fn)
-            f1 = safe_div(2 * prec * rec, prec + rec)
-            f1s.append(f1)
-        macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+        gt = np.array(self.gt, dtype=np.int32)
+        pred = np.array(self.pred, dtype=np.int32)
+        top1 = float(np.mean(gt == pred))
+        top3 = top1  # no ranked list
+        within1 = float(np.mean(np.abs(gt - pred) <= 1))
+        macro_f1 = _macro_f1(gt, pred, self.num_classes)
 
-        return {"top1_acc": top1, "within1_acc": within1, "macro_f1": macro_f1, "top3_acc": top1, "n": len(self.gts), "type": "count"}
-
-
-class SecAgg:
-    def __init__(self, taus=(1.0, 2.0, 5.0)):
-        self.gts: List[float] = []
-        self.preds: List[float] = []
-        self.taus = taus
-
-    def add(self, gt: float, pred: float):
-        self.gts.append(float(gt))
-        self.preds.append(float(pred))
-
-    def summarize(self) -> Dict[str, Any]:
-        if not self.gts:
-            return {"mae": 0.0, "rmse": 0.0, "nmae_gt": 0.0, "within_tau": {str(t): 0.0 for t in self.taus}, "n": 0, "type": "seconds"}
-        gt = np.array(self.gts, dtype=np.float32)
-        pr = np.array(self.preds, dtype=np.float32)
-        mae = float(np.mean(np.abs(gt - pr)))
-        rmse = float(np.sqrt(np.mean((gt - pr) ** 2)))
-        nmae_gt = float(mae / (float(np.mean(np.abs(gt))) + 1e-6))
-
-        within = {}
-        for t in self.taus:
-            within[str(t)] = float(np.mean(np.abs(gt - pr) <= float(t)))
-
-        return {"mae": mae, "rmse": rmse, "nmae_gt": nmae_gt, "within_tau": within, "n": len(self.gts), "type": "seconds"}
+        return {
+            "n": int(len(gt)),
+            "type": "count",
+            "top1_acc": top1,
+            "top3_acc": top3,
+            "within1_acc": within1,
+            "macro_f1": macro_f1,
+        }
 
 
 # ----------------------
-# task type inference (from meta)
+# vocab mapper
+# ----------------------
+
+class VocabMapper:
+    """
+    Load vocabs_train.json and provide mapping:
+      category -> label string -> id
+    """
+    def __init__(self, vocabs_path: Path):
+        with open(vocabs_path, "r", encoding="utf-8") as f:
+            voc = json.load(f)
+
+        # normalize keys
+        self.voc: Dict[str, List[str]] = {}
+        for k, arr in voc.items():
+            if not isinstance(arr, list):
+                continue
+            kk = str(k).lower()
+            self.voc[kk] = [str(x) for x in arr]
+
+        self.id_map: Dict[str, Dict[str, int]] = {}
+        for cat, labels in self.voc.items():
+            self.id_map[cat] = {lbl: i for i, lbl in enumerate(labels)}
+
+    def encode_gt(self, category: str, gt_label: str) -> int:
+        cat = category.lower()
+        labels = self.voc.get(cat, None)
+        if labels is None:
+            return 0
+        if gt_label in self.id_map.get(cat, {}):
+            return int(self.id_map[cat][gt_label])
+        # unknown => 0 if <UNK> exists else 0
+        if "<UNK>" in self.id_map.get(cat, {}):
+            return int(self.id_map[cat]["<UNK>"])
+        return 0
+
+    def encode_pred(self, category: str, pred_label: str) -> int:
+        return self.encode_gt(category, pred_label)
+
+
+# ----------------------
+# label type inference (Step b)
 # ----------------------
 
 def _infer_label_type(meta: Dict[str, Any], gt_answer: Any) -> str:
+    """
+    Robust label type inference for evaluation.
+
+    Returns one of:
+      {bool, count, duration, seconds, choice_index, text}
+
+    Priority:
+      1) meta.label_type / meta.answer_mode / meta.answer_type (with normalization)
+      2) meta.choice_K / meta.choices / question template ("Answer ... 1-K") => choice_index
+      3) category-based fallback (count/duration)
+      4) gt_answer-based fallback (bool / numeric -> seconds / else text)
+    """
+    # ---- 1) explicit type fields (normalize) ----
     lt = (meta.get("label_type") or "").lower().strip()
     if not lt:
         lt = (meta.get("answer_mode") or "").lower().strip()
@@ -433,31 +393,68 @@ def _infer_label_type(meta: Dict[str, Any], gt_answer: Any) -> str:
         lt = (meta.get("answer_type") or "").lower().strip()
 
     if lt in ("binary", "boolean", "bin", "yesno", "yes/no"):
-        return "bool"
-    if lt in ("choice", "mcq", "multi_choice", "multichoice", "option", "index"):
-        return "choice_index"
-    if lt in ("numeric", "number", "float", "int", "reg", "seconds", "duration"):
-        return "seconds"
-    if lt in ("count",):
-        return "count"
-    if lt in ("cat", "text", "string", "phrase"):
-        return "text"
+        lt = "bool"
+    elif lt in ("choice", "mcq", "multi_choice", "multichoice", "option", "index"):
+        lt = "choice_index"
+    elif lt in ("numeric", "number", "float", "int", "reg", "sec", "time"):
+        lt = "seconds"
+    elif lt in ("cat", "text", "string", "phrase"):
+        lt = "text"
 
-    # fallback: look at gt
+    if lt in ("bool", "count", "duration", "seconds", "choice_index", "text"):
+        return lt
+
+    # ---- 2) choice detection from meta/question ----
+    ck = meta.get("choice_K", None)
+    if isinstance(ck, int) and ck > 0:
+        return "choice_index"
+    if isinstance(meta.get("choices", None), list) and len(meta.get("choices")) > 0:
+        return "choice_index"
+
+    q = ""
+    raw = meta.get("qa_raw", None)
+    if isinstance(raw, dict):
+        q = raw.get("question") or ""
+    if not q:
+        q = meta.get("question") or ""
+
+    Kq = _parse_choice_K_from_question(q)
+    if isinstance(Kq, int) and Kq > 0:
+        return "choice_index"
+
+    # ---- 3) category-based fallback ----
+    cat = (meta.get("category") or "").lower().strip()
+    if cat == "phase":
+        cat = "phase_transition"
+    if cat == "count":
+        return "count"
+    if cat == "duration":
+        return "duration"
+
+    # ---- 4) gt_answer-based fallback ----
     if isinstance(gt_answer, bool):
         return "bool"
-    s = str(gt_answer).strip().lower()
+    if isinstance(gt_answer, (int, np.integer)) and int(gt_answer) in (0, 1) and cat in (
+        "ordering", "boundary", "concurrency", "extreme", "phase_transition"
+    ):
+        # Avoid mis-treating 0/1 bool answers as seconds.
+        return "bool"
+
+    if isinstance(gt_answer, (int, float, np.integer, np.floating)):
+        return "seconds"
+
+    s = str(gt_answer).strip().lower().strip(".")
     if s in ("true", "false", "yes", "no"):
         return "bool"
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", s):
+        # numeric but we failed to detect choice earlier => treat as seconds
         return "seconds"
-    if re.fullmatch(r"[-+]?\d+", s):
-        return "count"
+
     return "text"
 
 
 # ----------------------
-# main evaluation
+# evaluation main
 # ----------------------
 
 def evaluate_stsg(
@@ -467,18 +464,24 @@ def evaluate_stsg(
     vocabs_json: Optional[str] = None,
 ) -> Dict[str, Any]:
 
-    by_category = {
+    vocab_mapper: Optional[VocabMapper] = None
+    if vocabs_json:
+        vocab_mapper = VocabMapper(Path(vocabs_json))
+
+    by_category: Dict[str, Dict[str, Any]] = {
+        "boundary": {"bool": BinAgg(), "cat": CatAgg(), "seconds": SecAgg()},
+        "concurrency": {"bool": BinAgg(), "seconds": SecAgg(), "choice": CatAgg()},
         "count": {"count": CountAgg()},
         "duration": {"duration": SecAgg()},
+        "extreme": {"bool": BinAgg(), "cat": CatAgg(), "seconds": SecAgg()},
         "motion": {"cat": CatAgg()},
         "ordering": {"bool": BinAgg(), "cat": CatAgg(), "choice": CatAgg()},
-        "extreme": {"bool": BinAgg(), "cat": CatAgg(), "seconds": SecAgg()},
-        "concurrency": {"bool": BinAgg(), "seconds": SecAgg(), "choice": CatAgg()},
-        "boundary": {"bool": BinAgg(), "cat": CatAgg(), "seconds": SecAgg()},
         "phase_transition": {"bool": BinAgg(), "cat": CatAgg(), "seconds": SecAgg(), "choice": CatAgg()},
     }
 
-    task_hist = {
+    vocab_text_categories = {"boundary", "extreme", "motion", "ordering", "phase", "phase_transition"}
+
+    task_hist: Dict[str, int] = {
         "count": 0,
         "duration": 0,
         "motion": 0,
@@ -497,21 +500,52 @@ def evaluate_stsg(
         "phase_reg": 0,
         "phase_text": 0,
         "phase_bin": 0,
-        "ordering_choice_dup": 0,
-        "concurrency_choice_dup": 0,
-        "phase_choice_dup": 0,
+        "phase_choice": 0,
     }
 
-    vocab_mapper = VocabMapper(vocabs_json) if vocabs_json else None
-    vocab_text_categories = set(["motion", "boundary", "ordering", "extreme", "phase_transition"])
+    debug_info: Dict[str, int] = {
+        "choice_total": 0,
+        "choice_has_meta_K": 0,
+        "choice_K_from_question": 0,
+        "choice_missing_K": 0,
+        "meta_missing_question": 0,
+    }
 
     for gt_answer, pred_text_raw, meta in zip(references, predictions, metas):
-        category = (meta.get("category") or "").lower().strip()
+        category = (meta.get("category") or "").lower()
         if category == "phase":
             category = "phase_transition"
 
         label_type = _infer_label_type(meta, gt_answer)
         pred_text = extract_final_answer(pred_text_raw)
+
+        # ---- debug: question availability ----
+        _q_dbg = ""
+        _raw_dbg = meta.get("qa_raw", None)
+        if isinstance(_raw_dbg, dict):
+            _q_dbg = _raw_dbg.get("question") or ""
+        if not _q_dbg:
+            _q_dbg = meta.get("question") or ""
+        if not _q_dbg:
+            debug_info["meta_missing_question"] += 1
+
+        def _canon_ordering_text(s: str) -> str:
+            if not isinstance(s, str):
+                s = str(s)
+            x = s.strip().lower()
+
+            # 常见同义词归一
+            x = x.replace("prior to", "before").replace("earlier than", "before").replace("precede", "before")
+            x = x.replace("later than", "after").replace("subsequent to", "after").replace("follow", "after")
+
+            # 如果是 A after B -> 转成 B before A（尽量匹配你的 vocab）
+            if " after " in x and " before " not in x:
+                parts = x.split(" after ")
+                if len(parts) == 2:
+                    a, b = parts[0].strip(), parts[1].strip()
+                    if a and b:
+                        return f"{b} before {a}"
+            return s
 
         # ---- BOOL ----
         if label_type == "bool":
@@ -532,194 +566,216 @@ def evaluate_stsg(
             elif category == "ordering":
                 by_category["ordering"]["bool"].add(gt_bool, pred_bool, score_pos)
                 task_hist["ordering_bin"] += 1
-            elif category == "extreme":
-                by_category["extreme"]["bool"].add(gt_bool, pred_bool, score_pos)
-                task_hist["extreme_bin"] += 1
             elif category == "phase_transition":
                 by_category["phase_transition"]["bool"].add(gt_bool, pred_bool, score_pos)
                 task_hist["phase_bin"] += 1
-            else:
-                # unknown bool category
-                pass
+            elif category == "extreme":
+                by_category["extreme"]["bool"].add(gt_bool, pred_bool, score_pos)
+                task_hist["extreme_bin"] += 1
             continue
 
         # ---- COUNT ----
-        if category == "count" or label_type == "count":
-            gt_num = parse_numeric_gt(gt_answer)
-            if gt_num is None:
+        if label_type == "count":
+            gt_v = parse_numeric_gt(gt_answer)
+            if gt_v is None:
                 continue
-            gt_int = int(round(gt_num))
-            pred_int = extract_first_int(pred_text)
-            if pred_int is None:
-                pred_int = 0
-            by_category["count"]["count"].add(gt_int, pred_int)
+            gt_i = int(round(gt_v))
+
+            pred_i = extract_first_int(pred_text)
+            if pred_i is None:
+                pred_i = 0
+
+            by_category["count"]["count"].add(gt_i, pred_i)
             task_hist["count"] += 1
             continue
 
-        # ---- DURATION ----
-        if category == "duration":
-            gt_num = parse_numeric_gt(gt_answer)
-            if gt_num is None:
+        # ---- SECONDS (duration/reg) ----
+        if label_type in ("seconds", "duration", "reg"):
+            gt_v = parse_numeric_gt(gt_answer)
+            if gt_v is None:
                 continue
-            pred_num = extract_first_number(pred_text)
-            if pred_num is None:
-                pred_num = 0.0
-            by_category["duration"]["duration"].add(float(gt_num), float(pred_num))
-            task_hist["duration"] += 1
+            pred_v = extract_first_float(pred_text)
+            if pred_v is None:
+                pred_v = 0.0
+
+            if category == "duration":
+                by_category["duration"]["duration"].add(gt_v, pred_v)
+                task_hist["duration"] += 1
+            elif category == "boundary":
+                by_category["boundary"]["seconds"].add(gt_v, pred_v)
+                task_hist["boundary_reg"] += 1
+            elif category == "concurrency":
+                by_category["concurrency"]["seconds"].add(gt_v, pred_v)
+                task_hist["concurrency_reg"] += 1
+            elif category == "extreme":
+                by_category["extreme"]["seconds"].add(gt_v, pred_v)
+                task_hist["extreme_reg"] += 1
+            elif category == "phase_transition":
+                by_category["phase_transition"]["seconds"].add(gt_v, pred_v)
+                task_hist["phase_reg"] += 1
             continue
 
         # ---- CHOICE ----
-        # choice types are encoded under their category but meta may include choice_K
         if label_type == "choice_index":
-            gt_i = extract_first_int(str(gt_answer))
-            pr_i = extract_first_int(pred_text)
-            if gt_i is None:
+            gt_v = parse_numeric_gt(gt_answer)
+            if gt_v is None:
                 continue
-            if pr_i is None:
-                pr_i = -1
+            gt_idx = int(gt_v)
 
-            # unify to 0-based id (support both 0/1-based outputs)
-            if gt_i >= 1 and pr_i >= 1:
-                gt_id = gt_i - 1
-                pr_id = pr_i - 1
+            pred_idx = extract_first_int(pred_text)
+            if pred_idx is None:
+                pred_idx = 1  # 默认当 1-based 输出
+
+            K = meta.get("choice_K", None)
+            if not isinstance(K, int) or K <= 0:
+                q = ""
+                raw = meta.get("qa_raw", None)
+                if isinstance(raw, dict):
+                    q = raw.get("question") or ""
+                if not q:
+                    q = meta.get("question") or ""
+                Kq = _parse_choice_K_from_question(q)
+                if isinstance(Kq, int) and Kq > 0:
+                    K = Kq
+                else:
+                    choices = meta.get("choices", None)
+                    if isinstance(choices, list) and len(choices) > 0:
+                        K = len(choices)
+            debug_info["choice_total"] += 1
+            if isinstance(meta.get("choice_K", None), int) and meta.get("choice_K", None) > 0:
+                debug_info["choice_has_meta_K"] += 1
+            elif isinstance(_parse_choice_K_from_question(_q_dbg), int) and _parse_choice_K_from_question(_q_dbg) > 0:
+                debug_info["choice_K_from_question"] += 1
             else:
-                gt_id = gt_i
-                pr_id = pr_i
+                debug_info["choice_missing_K"] += 1
+
+            # ---- 统一 GT/PRED 为 0-based ----
+            gt_idx0 = gt_idx
+            pred_idx0 = pred_idx
+
+            if isinstance(K, int) and K > 0:
+                # GT：如果在 1..K，视为 1-based；如果在 0..K-1，视为 0-based
+                if 1 <= gt_idx <= K:
+                    gt_idx0 = gt_idx - 1
+                elif 0 <= gt_idx < K:
+                    gt_idx0 = gt_idx
+                else:
+                    gt_idx0 = max(0, min(gt_idx, K - 1))
+
+                # Pred：同理
+                if 1 <= pred_idx <= K:
+                    pred_idx0 = pred_idx - 1
+                elif 0 <= pred_idx < K:
+                    pred_idx0 = pred_idx
+                else:
+                    pred_idx0 = max(0, min(pred_idx, K - 1))
+            else:
+                # 没有 K 的兜底（一般不会发生，因为你已经能从 question 提取 K）
+                if gt_idx >= 1:
+                    gt_idx0 = gt_idx - 1
+                if pred_idx >= 1:
+                    pred_idx0 = pred_idx - 1
 
             if category == "ordering":
-                by_category["ordering"]["choice"].add(gt_id, pr_id)
+                by_category["ordering"]["choice"].add(int(gt_idx0), int(pred_idx0))
                 task_hist["ordering_choice"] += 1
             elif category == "concurrency":
-                by_category["concurrency"]["choice"].add(gt_id, pr_id)
+                by_category["concurrency"]["choice"].add(int(gt_idx0), int(pred_idx0))
                 task_hist["concurrency_choice"] += 1
             elif category == "phase_transition":
-                by_category["phase_transition"]["choice"].add(gt_id, pr_id)
+                by_category["phase_transition"]["choice"].add(int(gt_idx0), int(pred_idx0))
                 task_hist["phase_choice"] += 1
-            continue
-
-        # ---- SECONDS / REG ----
-        if label_type == "seconds":
-            gt_num = parse_numeric_gt(gt_answer)
-            if gt_num is None:
-                continue
-            pred_num = extract_first_number(pred_text)
-            if pred_num is None:
-                pred_num = 0.0
-
-            if category == "boundary":
-                by_category["boundary"]["seconds"].add(float(gt_num), float(pred_num))
-                task_hist["boundary_reg"] += 1
-            elif category == "concurrency":
-                by_category["concurrency"]["seconds"].add(float(gt_num), float(pred_num))
-                task_hist["concurrency_reg"] += 1
-            elif category == "extreme":
-                by_category["extreme"]["seconds"].add(float(gt_num), float(pred_num))
-                task_hist["extreme_reg"] += 1
-            elif category == "phase_transition":
-                by_category["phase_transition"]["seconds"].add(float(gt_num), float(pred_num))
-                task_hist["phase_reg"] += 1
-            else:
-                # unknown seconds category
-                pass
             continue
 
         # ---- TEXT ----
         gt_label_raw = str(gt_answer)
         pred_label_raw = pred_text
 
-        # Canonicalize ordering BEFORE vocab mapping (important!)
-        if category == "ordering":
-            gt_label_raw = canon_ordering_text(gt_label_raw)
-            pred_label_raw = canon_ordering_text(pred_label_raw)
-
         if vocab_mapper is not None and category in vocab_text_categories:
             gt_id = vocab_mapper.encode_gt(category, gt_label_raw)
-            pred_id = vocab_mapper.encode_pred(category, pred_label_raw)
+            pr_id = vocab_mapper.encode_pred(category, _canon_ordering_text(pred_label_raw) if category == "ordering" else pred_label_raw)
         else:
-            norm_gt = normalize_for_vocab_text(gt_label_raw)
-            norm_pr = normalize_for_vocab_text(pred_label_raw)
-            enc = LabelEncoder()
-            gt_id = enc.encode(norm_gt)
-            pred_id = enc.encode(norm_pr)
+            # if no vocab, fallback exact match on strings (degenerate)
+            gt_id = 0
+            pr_id = 0
+            if str(gt_label_raw).strip().lower() == str(pred_label_raw).strip().lower():
+                pr_id = 0
+            else:
+                pr_id = 1
 
-        if category == "boundary":
-            by_category["boundary"]["cat"].add(gt_id, pred_id)
-            task_hist["boundary_text"] += 1
-        elif category == "ordering":
-            by_category["ordering"]["cat"].add(gt_id, pred_id)
-            task_hist["ordering_text"] += 1
-        elif category == "phase_transition":
-            by_category["phase_transition"]["cat"].add(gt_id, pred_id)
-            task_hist["phase_text"] += 1
-        elif category == "extreme":
-            by_category["extreme"]["cat"].add(gt_id, pred_id)
-            task_hist["extreme_text"] += 1
-        elif category == "motion":
-            by_category["motion"]["cat"].add(gt_id, pred_id)
+        if category == "motion":
+            by_category["motion"]["cat"].add(gt_id, pr_id)
             task_hist["motion"] += 1
+        elif category == "ordering":
+            by_category["ordering"]["cat"].add(gt_id, pr_id)
+            task_hist["ordering_text"] += 1
+        elif category == "extreme":
+            by_category["extreme"]["cat"].add(gt_id, pr_id)
+            task_hist["extreme_text"] += 1
+        elif category == "boundary":
+            by_category["boundary"]["cat"].add(gt_id, pr_id)
+            task_hist["boundary_text"] += 1
+        elif category in ("phase", "phase_transition"):
+            by_category["phase_transition"]["cat"].add(gt_id, pr_id)
+            task_hist["phase_text"] += 1
 
-    # summarize
-    out = {"task_hist": task_hist, "by_category": {}, "overall_macro_score": 0.0}
+    # compute
+    bd_bool = by_category["boundary"]["bool"].compute()
+    bd_cat = by_category["boundary"]["cat"].compute()
+    bd_sec = by_category["boundary"]["seconds"].compute()
 
-    # boundary
-    out["by_category"]["boundary"] = {
-        "bool": by_category["boundary"]["bool"].summarize(),
-        "cat": by_category["boundary"]["cat"].summarize(),
-        "seconds": by_category["boundary"]["seconds"].summarize(),
-    }
-    # concurrency
-    out["by_category"]["concurrency"] = {
-        "bool": by_category["concurrency"]["bool"].summarize(),
-        "seconds": by_category["concurrency"]["seconds"].summarize(),
-        "choice": by_category["concurrency"]["choice"].summarize(),
-    }
-    # count
-    out["by_category"]["count"] = {"count": by_category["count"]["count"].summarize()}
-    # duration
-    out["by_category"]["duration"] = {"duration": by_category["duration"]["duration"].summarize()}
-    # extreme
-    out["by_category"]["extreme"] = {
-        "bool": by_category["extreme"]["bool"].summarize(),
-        "cat": by_category["extreme"]["cat"].summarize(),
-        "seconds": by_category["extreme"]["seconds"].summarize(),
-    }
-    # motion
-    out["by_category"]["motion"] = {"cat": by_category["motion"]["cat"].summarize()}
-    # ordering
-    out["by_category"]["ordering"] = {
-        "bool": by_category["ordering"]["bool"].summarize(),
-        "cat": by_category["ordering"]["cat"].summarize(),
-        "choice": by_category["ordering"]["choice"].summarize(),
-    }
-    # phase_transition
-    out["by_category"]["phase_transition"] = {
-        "bool": by_category["phase_transition"]["bool"].summarize(),
-        "cat": by_category["phase_transition"]["cat"].summarize(),
-        "seconds": by_category["phase_transition"]["seconds"].summarize(),
-        "choice": by_category["phase_transition"]["choice"].summarize(),
-    }
+    cc_bool = by_category["concurrency"]["bool"].compute()
+    cc_sec = by_category["concurrency"]["seconds"].compute()
+    cc_choice = by_category["concurrency"]["choice"].compute()
 
-    # overall macro score (simple average of available primary metrics)
-    primary = []
-    primary.append(out["by_category"]["count"]["count"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["duration"]["duration"].get("within_tau", {}).get("5.0", 0.0))
-    primary.append(out["by_category"]["motion"]["cat"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["ordering"]["bool"].get("f1", 0.0))
-    primary.append(out["by_category"]["ordering"]["cat"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["ordering"]["choice"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["extreme"]["bool"].get("f1", 0.0))
-    primary.append(out["by_category"]["extreme"]["cat"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["extreme"]["seconds"].get("within_tau", {}).get("5.0", 0.0))
-    primary.append(out["by_category"]["concurrency"]["bool"].get("f1", 0.0))
-    primary.append(out["by_category"]["concurrency"]["choice"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["concurrency"]["seconds"].get("within_tau", {}).get("5.0", 0.0))
-    primary.append(out["by_category"]["boundary"]["bool"].get("f1", 0.0))
-    primary.append(out["by_category"]["boundary"]["cat"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["boundary"]["seconds"].get("within_tau", {}).get("5.0", 0.0))
-    primary.append(out["by_category"]["phase_transition"]["bool"].get("f1", 0.0))
-    primary.append(out["by_category"]["phase_transition"]["cat"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["phase_transition"]["choice"].get("top1_acc", 0.0))
-    primary.append(out["by_category"]["phase_transition"]["seconds"].get("within_tau", {}).get("5.0", 0.0))
+    ct = by_category["count"]["count"].compute()
 
-    out["overall_macro_score"] = float(np.mean(primary)) if primary else 0.0
-    return out
+    dur = by_category["duration"]["duration"].compute()
+
+    ex_bool = by_category["extreme"]["bool"].compute()
+    ex_cat = by_category["extreme"]["cat"].compute()
+    ex_sec = by_category["extreme"]["seconds"].compute()
+
+    mo_cat = by_category["motion"]["cat"].compute()
+
+    od_bool = by_category["ordering"]["bool"].compute()
+    od_cat = by_category["ordering"]["cat"].compute()
+    od_choice = by_category["ordering"]["choice"].compute()
+
+    ph_bool = by_category["phase_transition"]["bool"].compute()
+    ph_cat = by_category["phase_transition"]["cat"].compute()
+    ph_sec = by_category["phase_transition"]["seconds"].compute()
+    ph_choice = by_category["phase_transition"]["choice"].compute()
+
+    # overall macro score: mean of key cells
+    cell_scores: List[float] = []
+
+    # bool: f1
+    cell_scores.extend([bd_bool["f1"], cc_bool["f1"], od_bool["f1"], ph_bool["f1"], ex_bool["f1"]])
+
+    # count/duration: within_tau or within1
+    cell_scores.append(ct["within1_acc"])
+    cell_scores.append(dur["within_tau"].get("2.0", 0.0))
+
+    # choice: top1
+    cell_scores.extend([od_choice["top1_acc"], cc_choice["top1_acc"], ph_choice["top1_acc"]])
+
+    # text cat: top1 (motion/extreme/boundary/ordering/phase)
+    cell_scores.extend([mo_cat["top1_acc"], ex_cat["top1_acc"], bd_cat["top1_acc"], od_cat["top1_acc"], ph_cat["top1_acc"]])
+
+    result = {
+        "task_hist": {k: int(v) for k, v in task_hist.items()},
+        "by_category": {
+            "boundary": {"bool": bd_bool, "cat": bd_cat, "seconds": bd_sec},
+            "concurrency": {"bool": cc_bool, "seconds": cc_sec, "choice": cc_choice},
+            "count": {"count": ct},
+            "duration": {"duration": dur},
+            "extreme": {"bool": ex_bool, "cat": ex_cat, "seconds": ex_sec},
+            "motion": {"cat": mo_cat},
+            "ordering": {"bool": od_bool, "cat": od_cat, "choice": od_choice},
+            "phase_transition": {"bool": ph_bool, "cat": ph_cat, "seconds": ph_sec, "choice": ph_choice},
+        },
+        "overall_macro_score": float(np.mean(cell_scores)) if cell_scores else 0.0,
+        "debug_info": {k: int(v) for k, v in debug_info.items()},
+    }
+    return result

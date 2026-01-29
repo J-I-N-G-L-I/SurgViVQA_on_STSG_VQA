@@ -59,6 +59,15 @@ def get_args():
     # rationale (optional)
     p.add_argument("--include_rationale", action="store_true")
     p.add_argument("--rationale_key", type=str, default="auto")
+    p.add_argument(
+        "--append_rationale_to_question",
+        action="store_true",
+        help="Append selected rationale to the end of question text in dataloader."
+    )
+
+    # NEW: strict output format constraint in prompt
+    p.add_argument("--strict_answer_format", action="store_true",
+                   help="Append a strict output-format block right before FINAL_ANSWER: for all task types.")
 
     p.add_argument("--save_dir", type=str, default="stsg_eval_outputs_full")
     p.add_argument("--seed", type=int, default=42)
@@ -119,6 +128,7 @@ def main(args):
         strict_missing_frame=False,
         include_rationale=args.include_rationale,
         rationale_key=args.rationale_key,
+        append_rationale_to_question=args.append_rationale_to_question,
     )
 
     loader = DataLoader(
@@ -142,6 +152,7 @@ def main(args):
         vocabs_json=args.text_vocab_json,
         count_max=args.count_max,
         closed_text_topk=args.closed_text_topk,
+        strict_answer_format=args.strict_answer_format,   # NEW
     )
 
     # ---- save per-sample jsonl ----
