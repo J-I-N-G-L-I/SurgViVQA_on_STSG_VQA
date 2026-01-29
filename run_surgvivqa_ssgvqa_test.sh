@@ -22,7 +22,7 @@ export TORCH_HOME=/mnt/scratch/sc232jl/torch_cache
 export TOKENIZERS_PARALLELISM=false
 
 # ---- Project directory ----
-REPO_DIR=/mnt/scratch/sc232jl/SurgViVQA_on_STSG_VQA
+REPO_DIR=/mnt/scratch/sc232jl/SurgViVQA
 cd ${REPO_DIR}
 
 # ---- Paths (edit as needed) ----
