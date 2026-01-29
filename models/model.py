@@ -143,12 +143,12 @@ class SurgViVQA(nn.Module):
           video_embeds: [B, V, D]
           video_atts:   [B, V]
         """
-                # If a single frame is provided, repeat to a pseudo-video of length self.num_frames
-                # This avoids VideoMAE crashes when num_frames < tubelet_size and ensures valid patch grids.
-                if video.dim() == 4:
-                        video = video.unsqueeze(1)  # [B, 1, 3, H, W]
-                if video.size(1) == 1 and self.num_frames > 1:
-                        video = video.repeat(1, self.num_frames, 1, 1, 1)
+        # If a single frame is provided, repeat to a pseudo-video of length self.num_frames
+        # This avoids VideoMAE crashes when num_frames < tubelet_size and ensures valid patch grids.
+        if video.dim() == 4:
+            video = video.unsqueeze(1)  # [B, 1, 3, H, W]
+        if video.size(1) == 1 and self.num_frames > 1:
+            video = video.repeat(1, self.num_frames, 1, 1, 1)
 
         out = self.visual_encoder(pixel_values=video)
         video_embeds = out.last_hidden_state
