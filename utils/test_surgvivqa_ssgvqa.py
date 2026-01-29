@@ -8,6 +8,7 @@ Key points:
 """
 
 import argparse
+import sys
 import json
 import logging
 import os
@@ -23,6 +24,11 @@ from torch.utils.data import DataLoader, Dataset
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, TaskType
+
+# Ensure repo root is on PYTHONPATH when running as a script
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from models.model import SurgViVQA
 from utils.inference import batch_decode

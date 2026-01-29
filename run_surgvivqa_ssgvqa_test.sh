@@ -17,7 +17,6 @@ conda activate SurgViVQAEnv
 
 # ---- Cache locations (HuggingFace/torch) ----
 export HF_HOME=/mnt/scratch/sc232jl/hf_home
-export TRANSFORMERS_CACHE=/mnt/scratch/sc232jl/hf_cache
 export TORCH_HOME=/mnt/scratch/sc232jl/torch_cache
 export TOKENIZERS_PARALLELISM=false
 
