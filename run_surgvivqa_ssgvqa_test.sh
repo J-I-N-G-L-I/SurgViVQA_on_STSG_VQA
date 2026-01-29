@@ -25,7 +25,7 @@ REPO_DIR=/mnt/scratch/sc232jl/SurgViVQA
 cd ${REPO_DIR}
 
 # ---- Paths (edit as needed) ----
-CKPT_PATH=/mnt/scratch/sc232jl/SurgViVQA/checkpoints/surgvivqa_ssgvqa/best_model.pth
+CKPT_PATH=/mnt/scratch/sc232jl/SurgViVQA/checkpoints/surgvivqa_gpt2_endovis_ckpt/best_model.pth
 SSGVQA_ROOT=/mnt/scratch/sc232jl/datasets/SSGVQA/ssg-qa
 IMAGE_ROOT=/mnt/scratch/sc232jl/datasets/CholecT45/data
 
