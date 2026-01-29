@@ -276,6 +276,7 @@ class SSGVQAStaticDataset(Dataset):
         self.video_ids = video_ids
         self.processor = processor
         self.strict_missing_image = strict_missing_image
+        self._log_processor_once = True
 
         self.samples: List[SSGVQASample] = []
         for vid in self.video_ids:
@@ -329,15 +330,36 @@ class SSGVQAStaticDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _process_image(self, image: Image.Image) -> torch.Tensor:
+        if self.processor is None:
+            raise RuntimeError("Processor is required for SurgViVQA inference.")
+
+        # Prefer keyword 'images' for AutoImageProcessor (VideoMAE uses image processor)
+        try:
+            processed = self.processor(images=image, return_tensors="pt")
+        except TypeError:
+            # Fallback: positional call for processors without 'images' kwarg
+            processed = self.processor(image, return_tensors="pt")
+
+        pixel_values = processed.get("pixel_values", None) if isinstance(processed, dict) else getattr(processed, "pixel_values", None)
+        if pixel_values is None:
+            raise RuntimeError("Processor output missing 'pixel_values'.")
+
+        # Log processor class and tensor shape only once to avoid spam
+        if self._log_processor_once:
+            self._log_processor_once = False
+            logging.info(
+                "Processor: %s | pixel_values shape: %s",
+                self.processor.__class__.__name__,
+                tuple(pixel_values.shape),
+            )
+
+        return pixel_values.squeeze(0).cpu().float()
+
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
         image = Image.open(sample.image_path).convert("RGB")
-        if self.processor is not None:
-            processed = self.processor(videos=[[image]], return_tensors="pt")
-            video_tensor = processed["pixel_values"].squeeze(0)  # [T, 3, 224, 224]
-        else:
-            # Fallback: simple resize + to tensor is handled by processor in this project
-            raise RuntimeError("Processor is required for SurgViVQA inference.")
+        video_tensor = self._process_image(image)  # [C, H, W]
 
         return video_tensor, sample.question, sample.answer, sample.video_id, sample.frame_id, sample.image_path
 
