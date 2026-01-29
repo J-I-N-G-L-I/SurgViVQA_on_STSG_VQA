@@ -43,7 +43,7 @@ python utils/test_surgvivqa_ssgvqa.py \
   --save-metrics ${METRICS_FILE} \
   --batch-size 4 \
   --workers 4 \
-  --num-frames 1 \
+  --num-frames 16 \
   --max-prompt-len 128 \
   --max-new-tokens 8 \
   --decode-mode closed \

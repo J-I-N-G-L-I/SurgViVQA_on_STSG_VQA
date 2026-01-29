@@ -38,7 +38,39 @@ class SurgViVQA(nn.Module):
             model_name,
             cache_dir="/scratch/sc232jl/.cache/huggingface",
         )
-        config.num_frames = int(num_frames)
+
+        # Normalize config fields to valid ints (VideoMAE expects scalar ints)
+        def _as_int(x, name: str):
+            if isinstance(x, (list, tuple)):
+                if len(x) == 0:
+                    raise ValueError(f"VideoMAE config {name} is empty.")
+                return int(x[0])
+            return int(x)
+
+        config.image_size = _as_int(config.image_size, "image_size")
+        config.patch_size = _as_int(config.patch_size, "patch_size")
+        config.tubelet_size = _as_int(config.tubelet_size, "tubelet_size")
+
+        # Ensure num_frames is compatible with tubelet_size to avoid zero patches
+        nf = int(num_frames)
+        if nf < int(config.tubelet_size):
+            print(
+                f"[WARN] num_frames ({nf}) < tubelet_size ({config.tubelet_size}); "
+                "bumping num_frames to tubelet_size for valid patch grid."
+            )
+            nf = int(config.tubelet_size)
+        config.num_frames = nf
+
+        # Log effective config values before model construction (for debugging)
+        print(
+            "[VideoMAEConfig] image_size=", config.image_size,
+            "patch_size=", config.patch_size,
+            "tubelet_size=", config.tubelet_size,
+            "num_frames=", config.num_frames,
+            "hidden_size=", config.hidden_size,
+        )
+
+        self.num_frames = int(config.num_frames)
 
         self.visual_encoder = VideoMAEModel.from_pretrained(
             model_name,
@@ -111,6 +143,13 @@ class SurgViVQA(nn.Module):
           video_embeds: [B, V, D]
           video_atts:   [B, V]
         """
+                # If a single frame is provided, repeat to a pseudo-video of length self.num_frames
+                # This avoids VideoMAE crashes when num_frames < tubelet_size and ensures valid patch grids.
+                if video.dim() == 4:
+                        video = video.unsqueeze(1)  # [B, 1, 3, H, W]
+                if video.size(1) == 1 and self.num_frames > 1:
+                        video = video.repeat(1, self.num_frames, 1, 1, 1)
+
         out = self.visual_encoder(pixel_values=video)
         video_embeds = out.last_hidden_state
         video_atts = torch.ones(video_embeds.size()[:-1], dtype=torch.long, device=video_embeds.device)

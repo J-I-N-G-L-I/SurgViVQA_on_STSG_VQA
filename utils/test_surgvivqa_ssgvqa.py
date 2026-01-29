@@ -585,7 +585,12 @@ def get_args() -> argparse.Namespace:
 
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--num-frames", type=int, default=1, help="Number of frames per sample (static QA uses 1)")
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=16,
+        help="VideoMAE expects multiple frames; single frames are repeated to this length.",
+    )
 
     parser.add_argument("--max-prompt-len", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=8)
