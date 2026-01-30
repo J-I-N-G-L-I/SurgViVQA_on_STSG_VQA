@@ -16,6 +16,7 @@ import random
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from collections import Counter
 
 import numpy as np
 import torch
@@ -118,6 +119,13 @@ def normalize_text(text: str) -> str:
     return s
 
 
+def _word_boundary_match(needle: str, haystack: str) -> bool:
+    if not needle or not haystack:
+        return False
+    pat = r"\b" + re.escape(needle) + r"\b"
+    return re.search(pat, haystack) is not None
+
+
 def extract_final_answer(text: str) -> str:
     if text is None:
         return ""
@@ -143,60 +151,58 @@ def map_pred_to_label(
     labels: List[str],
     exact_map: Dict[str, int],
     norm_map: Dict[str, int],
-) -> Tuple[str, int]:
+) -> Tuple[str, int, str]:
     """
     Map free-form prediction to closed-set label.
     Strategy: exact match -> boolean/number -> normalized match -> longest substring match.
-    Returns (label, idx) or ("", -1) if mapping fails.
+        Returns (label, idx, match_type) where match_type in:
+            {exact, synonym/inflection, substring, unknown}
     """
     if pred_text is None:
-        return "", -1
+                return "", -1, "unknown"
 
     raw = extract_final_answer(pred_text).strip()
     if not raw:
-        return "", -1
+        return "", -1, "unknown"
 
     # 1) exact match (case-sensitive) then case-insensitive
     if raw in exact_map:
-        return raw, exact_map[raw]
+        return raw, exact_map[raw], "exact"
     raw_norm = normalize_text(raw)
     if raw_norm in norm_map:
-        return labels[norm_map[raw_norm]], norm_map[raw_norm]
+        return labels[norm_map[raw_norm]], norm_map[raw_norm], "synonym/inflection"
 
     # 2) boolean mapping
     if raw_norm in ("yes", "true", "y", "t"):
         if "True" in exact_map:
-            return "True", exact_map["True"]
+            return "True", exact_map["True"], "synonym/inflection"
     if raw_norm in ("no", "false", "n", "f"):
         if "False" in exact_map:
-            return "False", exact_map["False"]
+            return "False", exact_map["False"], "synonym/inflection"
 
     # 3) numeric mapping (first integer)
     m = re.search(r"\b(\d+)\b", raw_norm)
     if m:
         num_str = m.group(1)
         if num_str in exact_map:
-            return num_str, exact_map[num_str]
+            return num_str, exact_map[num_str], "synonym/inflection"
 
-    # 4) longest substring match on normalized text
+    # 4) substring match with strict word-boundary constraint
     best_idx = -1
     best_len = -1
     for i, lbl in enumerate(labels):
         lbl_norm = normalize_text(lbl)
         if not lbl_norm:
             continue
-        if " " in lbl_norm:
-            hit = lbl_norm in raw_norm
-        else:
-            hit = re.search(rf"\b{re.escape(lbl_norm)}\b", raw_norm) is not None
+        hit = _word_boundary_match(lbl_norm, raw_norm)
         if hit and len(lbl_norm) > best_len:
             best_len = len(lbl_norm)
             best_idx = i
 
     if best_idx >= 0:
-        return labels[best_idx], best_idx
+        return labels[best_idx], best_idx, "substring"
 
-    return "", -1
+    return "", -1, "unknown"
 
 
 def compute_metrics(y_true: List[int], y_pred: List[int], num_classes: int) -> Dict[str, float]:
@@ -246,6 +252,56 @@ def compute_metrics(y_true: List[int], y_pred: List[int], num_classes: int) -> D
         "mAF1": mAF1,
         "wF1": wF1,
     }
+
+
+def _entropy_from_counts(counts: Dict[int, int]) -> float:
+    total = float(sum(counts.values()))
+    if total <= 0:
+        return 0.0
+    ent = 0.0
+    for c in counts.values():
+        p = float(c) / total
+        ent -= p * np.log(p + 1e-12)
+    return float(ent)
+
+
+def _topk_from_counts(counts: Dict[int, int], labels: List[str], k: int = 20) -> List[Tuple[str, int]]:
+    items = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:k]
+    return [(labels[i], int(c)) for i, c in items]
+
+
+def _ratios_from_counts(counts: Dict[int, int], topk: int = 5) -> Tuple[float, float]:
+    total = float(sum(counts.values()))
+    if total <= 0:
+        return 0.0, 0.0
+    sorted_counts = sorted(counts.values(), reverse=True)
+    top1 = float(sorted_counts[0]) / total if sorted_counts else 0.0
+    topk_ratio = float(sum(sorted_counts[:topk])) / total
+    return top1, topk_ratio
+
+
+def _question_type(q: str) -> str:
+    ql = (q or "").strip().lower()
+    if ql.startswith("are there") or ql.startswith("is there") or ql.startswith("there is"):
+        return "yesno"
+    if ql.startswith("how many"):
+        return "counting"
+    if any(tok in ql for tok in ["doing", "action", "performed", "performing", "doing?"]):
+        return "action"
+
+    # anatomy / instrument / color (keyword cues)
+    color_words = {"blue", "brown", "red", "white", "yellow", "silver"}
+    instrument_words = {"instrument", "grasper", "hook", "clipper", "scissors", "irrigator", "bipolar"}
+    anatomy_words = {"anatomy", "liver", "gallbladder", "gut", "omentum", "peritoneum", "cystic"}
+
+    if any(w in ql for w in color_words):
+        return "color"
+    if any(w in ql for w in instrument_words):
+        return "instrument"
+    if any(w in ql for w in anatomy_words):
+        return "anatomy"
+
+    return "other"
 
 
 # -----------------------------
@@ -455,15 +511,34 @@ def evaluate(args) -> None:
     # Stats
     unknown_gt_count = 0
     unknown_pred_count = 0
+    match_type_counts = Counter()
+    pred_counts = Counter()
+    gt_counts = Counter()
+    confusion_counts = Counter()
+    soft_correct = 0
+    soft_total = 0
+    topk_correct = 0
+    topk_total = 0
 
     y_true: List[int] = []
     y_pred: List[int] = []
     per_video_records: Dict[str, List[Tuple[int, int]]] = {}
+    by_qtype_records: Dict[str, List[Tuple[int, int]]] = {}
 
     with open(args.predictions_file, "w", encoding="utf-8") as fout:
         model.eval()
         with torch.no_grad():
+            processed = 0
             for videos, questions, answers, vids, frames, img_paths in loader:
+                if args.debug_first_n is not None and processed >= args.debug_first_n:
+                    break
+
+                if args.ablate_image:
+                    videos = torch.zeros_like(videos)
+
+                if args.ablate_text:
+                    questions = [args.ablate_text_prompt for _ in questions]
+
                 metas = [
                     {
                         "video_id": vid,
@@ -502,10 +577,35 @@ def evaluate(args) -> None:
 
                     if gt_idx == -1:
                         unknown_gt_count += 1
+                    else:
+                        gt_counts[gt_idx] += 1
 
-                    pred_label, pred_idx = map_pred_to_label(pred_raw, SSGVQA_LABELS, exact_map, norm_map)
+                    pred_label, pred_idx, match_type = map_pred_to_label(
+                        pred_raw, SSGVQA_LABELS, exact_map, norm_map
+                    )
                     if pred_idx == -1:
                         unknown_pred_count += 1
+                    else:
+                        pred_counts[pred_idx] += 1
+                    match_type_counts[match_type] += 1
+
+                    # Soft correctness: normalized pred text contains normalized GT label
+                    if gt_idx != -1:
+                        gt_norm = normalize_text(gt_label)
+                        pred_norm = normalize_text(pred_raw)
+                        if _word_boundary_match(gt_norm, pred_norm):
+                            soft_correct += 1
+                        soft_total += 1
+
+                    # Top-k accuracy if multiple label mentions appear in pred text
+                    pred_norm = normalize_text(pred_raw)
+                    cand_labels = [
+                        lbl for lbl in SSGVQA_LABELS if _word_boundary_match(normalize_text(lbl), pred_norm)
+                    ]
+                    if len(cand_labels) >= args.topk:
+                        topk_total += 1
+                        if gt_label in cand_labels[: args.topk]:
+                            topk_correct += 1
 
                     # Store JSONL record
                     fout.write(
@@ -531,6 +631,13 @@ def evaluate(args) -> None:
                         y_true.append(gt_idx)
                         y_pred.append(pred_idx)
                         per_video_records.setdefault(vid, []).append((gt_idx, pred_idx))
+                        confusion_counts[(gt_idx, pred_idx)] += 1
+                        qtype = _question_type(q)
+                        by_qtype_records.setdefault(qtype, []).append((gt_idx, pred_idx))
+
+                    processed += 1
+                    if args.debug_first_n is not None and processed >= args.debug_first_n:
+                        break
 
     # Overall metrics
     metrics = compute_metrics(y_true, y_pred, num_classes=len(SSGVQA_LABELS))
@@ -548,6 +655,42 @@ def evaluate(args) -> None:
     unknown_pred_ratio = float(unknown_pred_count) / float(max(1, len(dataset)))
     unknown_gt_ratio = float(unknown_gt_count) / float(max(1, len(dataset)))
 
+    # Diagnostics
+    pred_entropy = _entropy_from_counts(pred_counts)
+    gt_entropy = _entropy_from_counts(gt_counts)
+    pred_top1_ratio, pred_top5_ratio = _ratios_from_counts(pred_counts, topk=5)
+    gt_top1_ratio, gt_top5_ratio = _ratios_from_counts(gt_counts, topk=5)
+
+    pred_topk = _topk_from_counts(pred_counts, SSGVQA_LABELS, k=20)
+    gt_topk = _topk_from_counts(gt_counts, SSGVQA_LABELS, k=20)
+
+    confusion_topk = []
+    for (gt_i, pr_i), cnt in confusion_counts.most_common(30):
+        confusion_topk.append(
+            {
+                "gt_label": SSGVQA_LABELS[gt_i],
+                "pred_label": SSGVQA_LABELS[pr_i],
+                "count": int(cnt),
+            }
+        )
+
+    by_question_type = {}
+    for qtype, pairs in by_qtype_records.items():
+        if not pairs:
+            by_question_type[qtype] = {"n": 0, "acc": 0.0, "mAF1": 0.0}
+            continue
+        gt_list = [p[0] for p in pairs]
+        pred_list = [p[1] for p in pairs]
+        m = compute_metrics(gt_list, pred_list, num_classes=len(SSGVQA_LABELS))
+        by_question_type[qtype] = {
+            "n": int(len(pairs)),
+            "acc": m["acc"],
+            "mAF1": m["mAF1"],
+        }
+
+    soft_acc = float(soft_correct) / float(soft_total) if soft_total > 0 else 0.0
+    topk_acc = float(topk_correct) / float(topk_total) if topk_total > 0 else None
+
     report = {
         "overall": {
             **metrics,
@@ -557,8 +700,27 @@ def evaluate(args) -> None:
             "unknown_gt_ratio": unknown_gt_ratio,
             "unknown_pred_count": int(unknown_pred_count),
             "unknown_pred_ratio": unknown_pred_ratio,
+            "soft_acc": soft_acc,
+            "topk_acc": topk_acc,
         },
         "per_video": per_video,
+        "diagnostics": {
+            "pred_topk": pred_topk,
+            "gt_topk": gt_topk,
+            "pred_entropy": pred_entropy,
+            "gt_entropy": gt_entropy,
+            "top1_ratio": pred_top1_ratio,
+            "top5_ratio": pred_top5_ratio,
+            "gt_top1_ratio": gt_top1_ratio,
+            "gt_top5_ratio": gt_top5_ratio,
+            "match_type_counts": dict(match_type_counts),
+            "confusion_topk": confusion_topk,
+            "by_question_type": by_question_type,
+            "soft_acc": soft_acc,
+            "topk_acc": topk_acc,
+            "ablate_image": bool(args.ablate_image),
+            "ablate_text": bool(args.ablate_text),
+        },
         "label_vocab": SSGVQA_LABELS,
     }
 
@@ -579,6 +741,11 @@ def evaluate(args) -> None:
     logging.info("unknown_gt_count: %d", unknown_gt_count)
     logging.info("unknown_pred_count: %d", unknown_pred_count)
     logging.info("unknown_pred_ratio: %.6f", unknown_pred_ratio)
+    logging.info("Pred top20 distribution: %s", pred_topk)
+    logging.info("GT top20 distribution: %s", gt_topk)
+    logging.info("Match type distribution: %s", dict(match_type_counts))
+    logging.info("Most common confusions (top30): %s", confusion_topk)
+    logging.info("By question type: %s", by_question_type)
     logging.info("Saved predictions: %s", args.predictions_file)
     logging.info("Saved metrics: %s", args.save_metrics)
 
@@ -627,6 +794,13 @@ def get_args() -> argparse.Namespace:
 
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--strict-missing-image", action="store_true")
+
+    # Diagnostics / ablations
+    parser.add_argument("--debug-first-n", type=int, default=None, help="Only process first N samples for quick diagnostics")
+    parser.add_argument("--ablate-image", action="store_true", help="Replace input images with zeros")
+    parser.add_argument("--ablate-text", action="store_true", help="Replace questions with a fixed prompt")
+    parser.add_argument("--ablate-text-prompt", type=str, default="What is shown?", help="Fixed question for text ablation")
+    parser.add_argument("--topk", type=int, default=3, help="Top-k for optional multi-label accuracy")
 
     parser.add_argument("--log-file", required=True)
     parser.add_argument("--predictions-file", required=True)
