@@ -33,7 +33,7 @@ LOG_FILE=logs/ssgvqa_eval_${SLURM_JOB_ID}.log
 PRED_FILE=logs/ssgvqa_predictions_${SLURM_JOB_ID}.jsonl
 METRICS_FILE=logs/ssgvqa_metrics_${SLURM_JOB_ID}.json
 
-python utils/test_surgvivqa_ssgvqa.py \
+python utils/eval_surgvivqa_ssgvqa.py \
   --model-path ${CKPT_PATH} \
   --ssgvqa-root ${SSGVQA_ROOT} \
   --image-root ${IMAGE_ROOT} \
@@ -45,6 +45,7 @@ python utils/test_surgvivqa_ssgvqa.py \
   --workers 4 \
   --num-frames 16 \
   --max-prompt-len 128 \
-  --max-new-tokens 8 \
-  --decode-mode closed \
-  --strict-answer-format
+  --max-new-tokens 32 \
+  --decode-mode greedy \
+  --prompt-style freeform \
+  --log-every-n 200
