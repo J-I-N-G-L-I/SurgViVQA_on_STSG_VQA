@@ -446,7 +446,7 @@ class SSGVQAStaticDataset(Dataset):
         frame = self._process_image(image)  # [3, H, W]
 
         # Repeat single frame to T frames to satisfy [T, 3, H, W]
-        video_tensor = frame.unsqueeze(0).repeat(self.num_frames, 1, 1, 1)
+        video_tensor = frame.repeat(self.num_frames, 1, 1, 1)
 
         return video_tensor, sample.question, sample.answer, sample.video_id, sample.frame_id, sample.image_path
 

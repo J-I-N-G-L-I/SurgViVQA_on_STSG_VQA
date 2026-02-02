@@ -46,6 +46,6 @@ python utils/eval_surgvivqa_ssgvqa.py \
   --num-frames 16 \
   --max-prompt-len 128 \
   --max-new-tokens 32 \
-  --decode-mode greedy \
-  --prompt-style freeform \
+  --decode-mode closed \
+  --prompt-style label_only \
   --log-every-n 200
