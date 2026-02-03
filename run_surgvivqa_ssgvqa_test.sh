@@ -31,8 +31,10 @@ IMAGE_ROOT=/mnt/scratch/sc232jl/datasets/CholecT45/data
 
 LOG_FILE=logs/ssgvqa_eval_${SLURM_JOB_ID}.log
 PRED_FILE=logs/ssgvqa_predictions_${SLURM_JOB_ID}.jsonl
-METRICS_FILE=logs/ssgvqa_metrics_${SLURM_JOB_ID}.json
 
+# ----------------------------------------------
+# Example 1: simple prompt (short, natural QA)
+# ----------------------------------------------
 python utils/eval_surgvivqa_ssgvqa.py \
   --model-path ${CKPT_PATH} \
   --ssgvqa-root ${SSGVQA_ROOT} \
@@ -40,12 +42,31 @@ python utils/eval_surgvivqa_ssgvqa.py \
   --videos VID02 VID22 VID43 VID60 VID74 \
   --log-file ${LOG_FILE} \
   --predictions-file ${PRED_FILE} \
-  --save-metrics ${METRICS_FILE} \
   --batch-size 4 \
   --workers 4 \
   --num-frames 16 \
-  --max-prompt-len 128 \
+  --prompt-mode simple \
+  --max-input-tokens 128 \
   --max-new-tokens 32 \
-  --decode-mode closed \
-  --prompt-style label_only \
+  --log-every-n 200
+
+# --------------------------------------------------------
+# Example 2: choices prompt (full label list as candidates)
+# Note: choices mode greatly increases prompt token count,
+# so you should increase --max-input-tokens accordingly.
+# Use --max-new-tokens to control output length.
+# --------------------------------------------------------
+python utils/eval_surgvivqa_ssgvqa.py \
+  --model-path ${CKPT_PATH} \
+  --ssgvqa-root ${SSGVQA_ROOT} \
+  --image-root ${IMAGE_ROOT} \
+  --videos VID02 VID22 VID43 VID60 VID74 \
+  --log-file ${LOG_FILE} \
+  --predictions-file ${PRED_FILE} \
+  --batch-size 4 \
+  --workers 4 \
+  --num-frames 16 \
+  --prompt-mode choices \
+  --max-input-tokens 512 \
+  --max-new-tokens 16 \
   --log-every-n 200

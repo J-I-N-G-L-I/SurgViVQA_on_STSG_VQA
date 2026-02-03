@@ -1,10 +1,10 @@
 """
-SurgViVQA evaluation on SSGVQA static QA (aligned with LLaVA-Med style).
+SurgViVQA evaluation on SSGVQA static QA.
 
 Key goals:
 - Always log full raw generation text.
 - Ensure images tensor shape is [B, T, 3, H, W].
-- Support prompt styles: freeform vs label_only.
+- Support prompt modes: simple vs choices.
 """
 
 import argparse
@@ -12,13 +12,12 @@ import json
 import logging
 import os
 import random
-import re
 import sys
-from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -112,16 +111,9 @@ def normalize_text(text: str) -> str:
         return ""
     s = str(text).strip().lower()
     s = s.replace("_", " ")
-    s = re.sub(r"[^a-z0-9\s]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in s)
+    s = " ".join(s.split())
     return s
-
-
-def _word_boundary_match(needle: str, haystack: str) -> bool:
-    if not needle or not haystack:
-        return False
-    pat = r"\b" + re.escape(needle) + r"\b"
-    return re.search(pat, haystack) is not None
 
 
 def build_label_maps(labels: List[str]) -> Tuple[Dict[str, int], Dict[str, int]]:
@@ -135,48 +127,35 @@ def map_pred_to_label(
     labels: List[str],
     exact_map: Dict[str, int],
     norm_map: Dict[str, int],
-) -> Tuple[str, int, str]:
+) -> Tuple[str, int]:
     if pred_text is None:
-        return "", -1, "unknown"
-
+        return "", -1
     raw = str(pred_text).strip()
     if not raw:
-        return "", -1, "unknown"
+        return "", -1
 
     if raw in exact_map:
-        return raw, exact_map[raw], "exact"
+        return raw, exact_map[raw]
 
     raw_norm = normalize_text(raw)
     if raw_norm in norm_map:
-        return labels[norm_map[raw_norm]], norm_map[raw_norm], "synonym/inflection"
+        return labels[norm_map[raw_norm]], norm_map[raw_norm]
 
-    if raw_norm in ("yes", "true", "y", "t"):
-        if "True" in exact_map:
-            return "True", exact_map["True"], "synonym/inflection"
-    if raw_norm in ("no", "false", "n", "f"):
-        if "False" in exact_map:
-            return "False", exact_map["False"], "synonym/inflection"
+    if raw_norm in ("yes", "true", "y", "t") and "True" in exact_map:
+        return "True", exact_map["True"]
+    if raw_norm in ("no", "false", "n", "f") and "False" in exact_map:
+        return "False", exact_map["False"]
 
-    m = re.search(r"\b(\d+)\b", raw_norm)
-    if m:
-        num_str = m.group(1)
-        if num_str in exact_map:
-            return num_str, exact_map[num_str], "synonym/inflection"
+    for token in raw_norm.split():
+        if token.isdigit() and token in exact_map:
+            return token, exact_map[token]
 
-    best_idx = -1
-    best_len = -1
-    for i, lbl in enumerate(labels):
+    for lbl in labels:
         lbl_norm = normalize_text(lbl)
-        if not lbl_norm:
-            continue
-        if _word_boundary_match(lbl_norm, raw_norm) and len(lbl_norm) > best_len:
-            best_len = len(lbl_norm)
-            best_idx = i
+        if lbl_norm and f" {lbl_norm} " in f" {raw_norm} ":
+            return lbl, exact_map[lbl]
 
-    if best_idx >= 0:
-        return labels[best_idx], best_idx, "substring"
-
-    return "", -1, "unknown"
+    return "", -1
 
 
 def compute_metrics(y_true: List[int], y_pred: List[int], num_classes: int) -> Dict[str, float]:
@@ -212,219 +191,110 @@ def compute_metrics(y_true: List[int], y_pred: List[int], num_classes: int) -> D
     return {"acc": acc, "mAP": mAP, "mAR": mAR, "mAF1": mAF1, "wF1": wF1}
 
 
-def _entropy_from_counts(counts: Dict[int, int]) -> float:
-    total = float(sum(counts.values()))
-    if total <= 0:
-        return 0.0
-    ent = 0.0
-    for c in counts.values():
-        p = float(c) / total
-        ent -= p * np.log(p + 1e-12)
-    return float(ent)
-
-
-def _topk_from_counts(counts: Dict[int, int], labels: List[str], k: int = 20) -> List[Tuple[str, int]]:
-    items = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:k]
-    return [(labels[i], int(c)) for i, c in items]
-
-
-def _ratios_from_counts(counts: Dict[int, int], topk: int = 5) -> Tuple[float, float]:
-    total = float(sum(counts.values()))
-    if total <= 0:
-        return 0.0, 0.0
-    sorted_counts = sorted(counts.values(), reverse=True)
-    top1 = float(sorted_counts[0]) / total if sorted_counts else 0.0
-    topk_ratio = float(sum(sorted_counts[:topk])) / total
-    return top1, topk_ratio
-
-
-def _build_prompt(question: str, prompt_style: str, labels: List[str]) -> str:
+def build_prompt(question: str, mode: str) -> str:
     q = (question or "").strip()
-    if prompt_style == "label_only":
-        choices = ", ".join(labels)
+    if mode == "choices":
+        candidates = ", ".join(SSGVQA_LABELS)
         return (
-            "Choose exactly ONE answer from the choices.\n"
-            "Output exactly one line: FINAL: <CHOICE>\n"
-            f"CHOICES: {choices}\n"
+            "You are given a surgical image. Choose the best answer from the candidate list.\n"
+            f"Candidates: {candidates}\n"
             f"Question: {q}\n"
             "Answer:"
         )
-    # freeform
-    return f"Question: {q}\nAnswer:"
+    return (
+        "You are given a surgical image. Answer the question based on the image. Answer concisely.\n"
+        f"Question: {q}\n"
+        "Answer:"
+    )
 
 
-def greedy_generate(
-    images: torch.Tensor,
-    questions: List[str],
+def to_chw_frame(pixel_values: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(pixel_values):
+        pixel_values = torch.tensor(pixel_values)
+    if pixel_values.dim() == 5:
+        # [1, 1, 3, H, W]
+        return pixel_values.squeeze(0).squeeze(0)
+    if pixel_values.dim() == 4:
+        # [1, 3, H, W]
+        return pixel_values.squeeze(0)
+    if pixel_values.dim() == 3:
+        # [3, H, W]
+        return pixel_values
+    raise ValueError(f"Unexpected pixel_values shape: {tuple(pixel_values.shape)}")
+
+
+def _get_original_lengths(tokenizer, prompts: List[str]) -> List[int]:
+    try:
+        raw = tokenizer(prompts, padding=False, truncation=False, return_length=True)
+        if "length" in raw:
+            return [int(x) for x in raw["length"]]
+    except TypeError:
+        pass
+    lengths = []
+    for p in prompts:
+        enc = tokenizer(p, padding=False, truncation=False)
+        lengths.append(len(enc["input_ids"]))
+    return lengths
+
+
+def generate_outputs(
     model,
     tokenizer,
-    max_prompt_len: int,
+    videos: torch.Tensor,
+    prompts: List[str],
+    max_input_tokens: int,
     max_new_tokens: int,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+    num_beams: int,
     device,
-    prompt_style: str,
-) -> List[str]:
-    prompts = [_build_prompt(q, prompt_style, SSGVQA_LABELS) for q in questions]
+):
     tok = tokenizer(
         prompts,
         padding=True,
         truncation=True,
-        max_length=max_prompt_len,
+        max_length=max_input_tokens,
         return_tensors="pt",
     )
     input_ids = tok["input_ids"].to(device)
     attn_mask = tok["attention_mask"].to(device)
 
-    # Encode video once; model handles single-frame repetition internally if needed
-    video_embeds, video_atts = model.encode_video(images.to(device))
+    video_embeds, video_atts = model.encode_video(videos.to(device))
+    text_out = model.text_encoder(
+        input_ids=input_ids,
+        attention_mask=attn_mask,
+        encoder_hidden_states=video_embeds,
+        encoder_attention_mask=video_atts,
+        return_dict=True,
+    )
+    text_embeds = text_out.last_hidden_state
 
-    bsz = input_ids.size(0)
-    total_len = max_prompt_len + max_new_tokens
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    gen_ids = model.llm.generate(
+        inputs_embeds=text_embeds,
+        attention_mask=attn_mask,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        num_beams=num_beams,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
 
-    padded_ids = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
-    padded_att = torch.zeros((bsz, total_len), dtype=torch.long, device=device)
-
-    L0 = input_ids.size(1)
-    padded_ids[:, :L0] = input_ids
-    padded_att[:, :L0] = attn_mask
-
-    valid_lens = padded_att.sum(dim=1).long()
-    batch_idx = torch.arange(bsz, device=device)
-    finished = torch.zeros(bsz, dtype=torch.bool, device=device)
-
-    only_new = torch.empty((bsz, 0), dtype=torch.long, device=device)
-
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            max_valid = int(valid_lens.max().item())
-            if max_valid >= total_len:
-                break
-
-            ids_now = padded_ids[:, :max_valid]
-            att_now = padded_att[:, :max_valid]
-
-            logits = model(
-                video=None,
-                qa_inputs_ids=ids_now,
-                qa_att_mask=att_now,
-                video_embeds=video_embeds,
-                video_atts=video_atts,
-            )
-            next_logits = logits[batch_idx, valid_lens - 1]
-            next_ids = torch.argmax(next_logits, dim=-1)
-
-            if tokenizer.eos_token_id is not None:
-                next_ids = torch.where(finished, torch.tensor(pad_id, device=device), next_ids)
-                finished = finished | (next_ids == tokenizer.eos_token_id)
-
-            padded_ids[batch_idx, valid_lens] = next_ids
-            padded_att[batch_idx, valid_lens] = (~finished).long()
-            valid_lens = valid_lens + (~finished).long()
-
-            only_new = torch.cat([only_new, next_ids.unsqueeze(1)], dim=1)
-            if bool(finished.all()):
-                break
+    max_prompt_len = input_ids.size(1)
+    gen_only = gen_ids[:, max_prompt_len:]
 
     outputs: List[str] = []
-    for i in range(bsz):
-        seq = only_new[i].tolist()
+    output_token_lens: List[int] = []
+    for i in range(gen_only.size(0)):
+        seq = gen_only[i].tolist()
         if tokenizer.eos_token_id is not None and tokenizer.eos_token_id in seq:
             seq = seq[: seq.index(tokenizer.eos_token_id)]
+        output_token_lens.append(len(seq))
         outputs.append(tokenizer.decode(seq, skip_special_tokens=True).strip())
-    return outputs
 
-
-def score_labels_closedset(
-    model,
-    video_embeds: torch.Tensor,
-    video_atts: torch.Tensor,
-    prompt_ids: torch.Tensor,
-    prompt_att: torch.Tensor,
-    tokenizer,
-    labels: List[str],
-    max_prompt_len: int,
-) -> Tuple[torch.Tensor, List[List[Tuple[str, float]]]]:
-    """
-    Closed-set scoring via teacher forcing.
-    Returns:
-      - scores: [B, num_labels] logprob sums
-      - top5: per-sample list of (label, score)
-    """
-    device = prompt_ids.device
-    bsz = prompt_ids.size(0)
-    num_labels = len(labels)
-
-    # Tokenize labels with leading space to align GPT2 BPE boundaries
-    label_texts = [" " + lbl for lbl in labels]
-    label_tok = tokenizer(
-        label_texts,
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-        add_special_tokens=False,
-    )
-    label_ids = label_tok["input_ids"].to(device)
-    label_att = label_tok["attention_mask"].to(device)
-
-    # Expand prompt and labels to [B*num_labels, ...]
-    prompt_ids_exp = prompt_ids.unsqueeze(1).expand(bsz, num_labels, -1).reshape(bsz * num_labels, -1)
-    prompt_att_exp = prompt_att.unsqueeze(1).expand(bsz, num_labels, -1).reshape(bsz * num_labels, -1)
-
-    label_ids_exp = label_ids.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * num_labels, -1)
-    label_att_exp = label_att.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * num_labels, -1)
-
-    # Concatenate prompt + completion and trim to max_prompt_len
-    concat_ids = torch.cat([prompt_ids_exp, label_ids_exp], dim=1)
-    concat_att = torch.cat([prompt_att_exp, label_att_exp], dim=1)
-
-    if concat_ids.size(1) > max_prompt_len:
-        concat_ids = concat_ids[:, :max_prompt_len]
-        concat_att = concat_att[:, :max_prompt_len]
-
-    # Align video embeds/atts to expanded batch
-    video_embeds_exp = video_embeds.unsqueeze(1).expand(bsz, num_labels, -1, -1).reshape(
-        bsz * num_labels, video_embeds.size(1), video_embeds.size(2)
-    )
-    video_atts_exp = video_atts.unsqueeze(1).expand(bsz, num_labels, -1).reshape(
-        bsz * num_labels, video_atts.size(1)
-    )
-
-    # Forward
-    logits = model(
-        video=None,
-        qa_inputs_ids=concat_ids,
-        qa_att_mask=concat_att,
-        video_embeds=video_embeds_exp,
-        video_atts=video_atts_exp,
-    )
-
-    # Teacher forcing: sum logprobs of completion tokens only
-    log_probs = torch.log_softmax(logits, dim=-1)
-    next_token_logp = log_probs[:, :-1, :].gather(2, concat_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
-
-    prompt_len = prompt_att_exp.sum(dim=1).long()
-    comp_len = label_att_exp.sum(dim=1).long()
-    token_positions = torch.arange(next_token_logp.size(1), device=device).unsqueeze(0)
-    comp_start = prompt_len - 1
-    comp_end = comp_start + comp_len
-    comp_mask = (token_positions >= comp_start.unsqueeze(1)) & (token_positions < comp_end.unsqueeze(1))
-
-    comp_mask = comp_mask & (token_positions < concat_att[:, 1:].sum(dim=1, keepdim=True))
-    scores = (next_token_logp * comp_mask.float()).sum(dim=1)
-
-    scores = scores.view(bsz, num_labels)
-
-    top5_vals, top5_idx = torch.topk(scores, k=min(5, num_labels), dim=1)
-    top5: List[List[Tuple[str, float]]] = []
-    for i in range(bsz):
-        items = []
-        for j in range(top5_idx.size(1)):
-            lbl = labels[int(top5_idx[i, j].item())]
-            val = float(top5_vals[i, j].item())
-            items.append((lbl, val))
-        top5.append(items)
-
-    return scores, top5
+    return tok, outputs, output_token_lens
 
 
 # -----------------------------
@@ -531,15 +401,16 @@ class SSGVQAStaticDataset(Dataset):
                 tuple(pixel_values.shape),
             )
 
-        return pixel_values.squeeze(0).cpu().float()
+        return pixel_values.cpu().float()
 
     def __getitem__(self, idx: int):
         sample = self.samples[idx]
         image = Image.open(sample.image_path).convert("RGB")
-        frame = self._process_image(image)  # [3, H, W]
+        pixel_values = self._process_image(image)
+        frame = to_chw_frame(pixel_values)  # [3, H, W]
 
         # Repeat single frame to T frames to satisfy [T, 3, H, W]
-        video_tensor = frame.repeat(self.num_frames, 1, 1, 1)
+        video_tensor = frame.unsqueeze(0).repeat(self.num_frames, 1, 1, 1)
 
         return video_tensor, sample.question, sample.answer, sample.video_id, sample.frame_id, sample.image_path
 
@@ -582,11 +453,8 @@ def load_checkpoint(model, ckpt_path: str) -> None:
 
 def evaluate(args) -> None:
     pred_dir = os.path.dirname(args.predictions_file)
-    metrics_dir = os.path.dirname(args.save_metrics)
     if pred_dir:
         os.makedirs(pred_dir, exist_ok=True)
-    if metrics_dir:
-        os.makedirs(metrics_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -638,19 +506,14 @@ def evaluate(args) -> None:
 
     logging.info("Total samples: %d", len(dataset))
 
-    exact_map, norm_map = build_label_maps(SSGVQA_LABELS)
-
-    unknown_gt_count = 0
-    unknown_pred_count = 0
-    anymatch_correct = 0
-    match_type_counts = Counter()
-    pred_counts = Counter()
-    gt_counts = Counter()
-    confusion_counts = Counter()
-
+    total_samples = 0
+    empty_output_count = 0
+    total_output_tokens = 0
+    total_prompt_tokens = 0
+    truncated_count = 0
     y_true: List[int] = []
     y_pred: List[int] = []
-    per_video_records: Dict[str, List[Tuple[int, int]]] = {}
+    exact_map, norm_map = build_label_maps(SSGVQA_LABELS)
 
     with open(args.predictions_file, "w", encoding="utf-8") as fout:
         model.eval()
@@ -660,109 +523,68 @@ def evaluate(args) -> None:
                 if args.debug_first_n is not None and processed >= args.debug_first_n:
                     break
 
-                if args.ablate_image:
-                    videos = torch.zeros_like(videos)
-
-                if args.ablate_text:
-                    questions = [args.ablate_text_prompt for _ in questions]
-
                 if processed == 0:
                     logging.info("Images tensor shape: %s", tuple(videos.shape))
 
-                # Always keep raw generation for external LLM semantics
-                raw_preds = greedy_generate(
-                    images=videos,
-                    questions=questions,
+                prompts = [build_prompt(q, args.prompt_mode) for q in questions]
+                orig_lens = _get_original_lengths(tokenizer, prompts)
+                tok, raw_preds, output_token_lens = generate_outputs(
                     model=model,
                     tokenizer=tokenizer,
-                    max_prompt_len=args.max_prompt_len,
+                    videos=videos,
+                    prompts=prompts,
+                    max_input_tokens=args.max_input_tokens,
                     max_new_tokens=args.max_new_tokens,
+                    do_sample=args.do_sample,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
                     device=device,
-                    prompt_style="freeform",
                 )
 
-                closed_scores = None
-                closed_top5 = None
-                closed_best_idx = None
-                if args.decode_mode == "closed":
-                    # Fixed short prompt inside training distribution
-                    short_prompts = [f"Question: {(q or '').strip()}\nAnswer:" for q in questions]
-                    tok = tokenizer(
-                        short_prompts,
-                        padding=True,
-                        truncation=True,
-                        max_length=args.max_prompt_len,
-                        return_tensors="pt",
-                    )
-                    prompt_ids = tok["input_ids"].to(device)
-                    prompt_att = tok["attention_mask"].to(device)
+                tokenized_lens = tok["attention_mask"].sum(dim=1).tolist()
+                truncated_flags = [int(orig_lens[i] > args.max_input_tokens) for i in range(len(prompts))]
 
-                    truncated = bool(prompt_ids.size(1) >= args.max_prompt_len)
-                    if (args.debug_first_n is not None) or (processed == 0):
-                        tok_len = int(prompt_ids.size(1))
-                        prompt_text = short_prompts[0]
-                        head = prompt_text[:120].replace("\n", "\\n")
-                        tail = prompt_text[-120:].replace("\n", "\\n")
-                        logging.info("[Closed] tokenized_len=%d | trunc=%s", tok_len, truncated)
-                        logging.info("[Closed] prompt head: %s", head)
-                        logging.info("[Closed] prompt tail: %s", tail)
-
-                    video_embeds, video_atts = model.encode_video(videos.to(device))
-                    closed_scores, closed_top5 = score_labels_closedset(
-                        model=model,
-                        video_embeds=video_embeds,
-                        video_atts=video_atts,
-                        prompt_ids=prompt_ids,
-                        prompt_att=prompt_att,
-                        tokenizer=tokenizer,
-                        labels=SSGVQA_LABELS,
-                        max_prompt_len=args.max_prompt_len,
+                if (args.debug_first_n is not None) or (processed == 0):
+                    head = prompts[0][:120].replace("\n", "\\n")
+                    tail = prompts[0][-120:].replace("\n", "\\n")
+                    logging.info(
+                        "tokenized_len=%d | truncated=%s | max_input_tokens=%d",
+                        int(tokenized_lens[0]),
+                        bool(truncated_flags[0]),
+                        int(args.max_input_tokens),
                     )
-                    closed_best_idx = torch.argmax(closed_scores, dim=1)
+                    logging.info("prompt head: %s", head)
+                    logging.info("prompt tail: %s", tail)
 
                 for i, (q, gt, vid, fid, ip, pred_raw) in enumerate(
                     zip(questions, answers, vids, frames, img_paths, raw_preds)
                 ):
                     gt_label = gt.strip()
                     gt_labels = [s.strip() for s in gt_label.split(",") if s.strip()]
-                    gt_set = set(gt_labels) if gt_labels else set()
-
                     gt_idx = -1
                     if gt_labels:
                         for candidate in gt_labels:
-                            gt_idx = exact_map.get(candidate, -1)
-                            if gt_idx == -1:
-                                gt_norm = normalize_text(candidate)
-                                gt_idx = norm_map.get(gt_norm, -1)
-                            if gt_idx != -1:
+                            mapped_label, mapped_idx = map_pred_to_label(candidate, SSGVQA_LABELS, exact_map, norm_map)
+                            if mapped_idx != -1:
+                                gt_idx = mapped_idx
                                 break
 
-                    if gt_idx == -1:
-                        unknown_gt_count += 1
-                    else:
-                        gt_counts[gt_idx] += 1
+                    pred_label, pred_idx = map_pred_to_label(pred_raw, SSGVQA_LABELS, exact_map, norm_map)
+                    tokenized_len = int(tokenized_lens[i])
+                    truncated = bool(truncated_flags[i])
+                    output_token_len = int(output_token_lens[i])
 
-                    pred_label, pred_idx, match_type = ("", -1, "unknown")
-                    closed_pred_label = ""
-                    closed_pred_idx = -1
-                    closed_top5_rec = []
-                    if args.decode_mode == "closed":
-                        closed_pred_idx = int(closed_best_idx[i].item())
-                        closed_pred_label = SSGVQA_LABELS[closed_pred_idx]
-                        closed_top5_rec = [
-                            {"label": lbl, "score": float(score)} for lbl, score in (closed_top5[i] or [])
-                        ]
-                        pred_label = closed_pred_label
-                        pred_idx = closed_pred_idx
-                        match_type = "closed_score"
-                        if (args.debug_first_n is not None) or (processed == 0):
-                            logging.info("[Closed] top5: %s", closed_top5_rec)
-
-                    if pred_idx == -1:
-                        unknown_pred_count += 1
-                    else:
-                        pred_counts[pred_idx] += 1
-                    match_type_counts[match_type] += 1
+                    total_samples += 1
+                    total_output_tokens += output_token_len
+                    total_prompt_tokens += tokenized_len
+                    if truncated:
+                        truncated_count += 1
+                    if not pred_raw:
+                        empty_output_count += 1
+                    if gt_idx != -1 and pred_idx != -1:
+                        y_true.append(gt_idx)
+                        y_pred.append(pred_idx)
 
                     # Store JSONL record
                     fout.write(
@@ -773,127 +595,57 @@ def evaluate(args) -> None:
                                 "image_path": ip,
                                 "question": q,
                                 "gt_answer": gt_label,
-                                "gt_labels": gt_labels,
+                                "prompt_mode": args.prompt_mode,
+                                "prompt_used": prompts[i],
                                 "raw_pred_text": pred_raw,
-                                "match_type": match_type,
-                                "mapped_pred_label": pred_label,
-                                "mapped_pred_idx": pred_idx,
-                                "closed_pred_label": closed_pred_label,
-                                "closed_pred_idx": closed_pred_idx,
-                                "closed_top5": closed_top5_rec,
+                                "tokenized_len": tokenized_len,
+                                "truncated": truncated,
+                                "max_input_tokens": int(args.max_input_tokens),
+                                "max_new_tokens": int(args.max_new_tokens),
+                                "output_token_len": output_token_len,
                             },
                             ensure_ascii=False,
                         )
                         + "\n"
                     )
 
-                    gt_anymatch = False
-                    if gt_set and pred_label:
-                        gt_anymatch = pred_label in gt_set
-                    if gt_anymatch:
-                        anymatch_correct += 1
-
-                    if gt_idx != -1 and pred_idx != -1:
-                        y_true.append(gt_idx)
-                        y_pred.append(pred_idx)
-                        per_video_records.setdefault(vid, []).append((gt_idx, pred_idx))
-                        confusion_counts[(gt_idx, pred_idx)] += 1
-
                     if args.log_every_n > 0 and processed % args.log_every_n == 0:
                         logging.info("Sample q: %s", q)
                         logging.info("Sample gt: %s", gt_label)
                         logging.info("Sample pred raw: %s", pred_raw)
+                        logging.info("Sample tokenized_len: %d", tokenized_len)
+                        logging.info("Sample output_token_len: %d", output_token_len)
 
                     processed += 1
                     if args.debug_first_n is not None and processed >= args.debug_first_n:
                         break
 
+    num_samples = int(total_samples)
+    empty_output_ratio = float(empty_output_count) / float(max(1, total_samples))
+    avg_output_token_len = float(total_output_tokens) / float(max(1, total_samples))
+    avg_prompt_token_len = float(total_prompt_tokens) / float(max(1, total_samples))
+    truncated_ratio = float(truncated_count) / float(max(1, total_samples))
+
     metrics = compute_metrics(y_true, y_pred, num_classes=len(SSGVQA_LABELS))
-    anymatch_acc = float(anymatch_correct) / float(max(1, len(dataset)))
-
-    per_video = {}
-    for vid, pairs in per_video_records.items():
-        if not pairs:
-            per_video[vid] = compute_metrics([], [], num_classes=len(SSGVQA_LABELS))
-            continue
-        gt_list = [p[0] for p in pairs]
-        pred_list = [p[1] for p in pairs]
-        per_video[vid] = compute_metrics(gt_list, pred_list, num_classes=len(SSGVQA_LABELS))
-
-    unknown_pred_ratio = float(unknown_pred_count) / float(max(1, len(dataset)))
-    unknown_gt_ratio = float(unknown_gt_count) / float(max(1, len(dataset)))
-
-    pred_entropy = _entropy_from_counts(pred_counts)
-    gt_entropy = _entropy_from_counts(gt_counts)
-    pred_top1_ratio, pred_top5_ratio = _ratios_from_counts(pred_counts, topk=5)
-    gt_top1_ratio, gt_top5_ratio = _ratios_from_counts(gt_counts, topk=5)
-    pred_topk = _topk_from_counts(pred_counts, SSGVQA_LABELS, k=20)
-    gt_topk = _topk_from_counts(gt_counts, SSGVQA_LABELS, k=20)
-
-    confusion_topk = []
-    for (gt_i, pr_i), cnt in confusion_counts.most_common(30):
-        confusion_topk.append(
-            {
-                "gt_label": SSGVQA_LABELS[gt_i],
-                "pred_label": SSGVQA_LABELS[pr_i],
-                "count": int(cnt),
-            }
-        )
-
-    report = {
-        "overall": {
-            **metrics,
-            "anymatch_acc": anymatch_acc,
-            "num_samples": int(len(dataset)),
-            "num_eval_samples": int(len(y_true)),
-            "unknown_gt_count": int(unknown_gt_count),
-            "unknown_gt_ratio": unknown_gt_ratio,
-            "unknown_pred_count": int(unknown_pred_count),
-            "unknown_pred_ratio": unknown_pred_ratio,
-        },
-        "per_video": per_video,
-        "diagnostics": {
-            "pred_topk": pred_topk,
-            "gt_topk": gt_topk,
-            "pred_entropy": pred_entropy,
-            "gt_entropy": gt_entropy,
-            "top1_ratio": pred_top1_ratio,
-            "top5_ratio": pred_top5_ratio,
-            "gt_top1_ratio": gt_top1_ratio,
-            "gt_top5_ratio": gt_top5_ratio,
-            "match_type_counts": dict(match_type_counts),
-            "confusion_topk": confusion_topk,
-            "ablate_image": bool(args.ablate_image),
-            "ablate_text": bool(args.ablate_text),
-        },
-        "label_vocab": SSGVQA_LABELS,
+    summary = {
+        "num_samples": num_samples,
+        "empty_output_ratio": empty_output_ratio,
+        "avg_output_token_len": avg_output_token_len,
+        "avg_prompt_token_len": avg_prompt_token_len,
+        "truncated_ratio": truncated_ratio,
+        "acc": metrics["acc"],
+        "mAP": metrics["mAP"],
+        "mAR": metrics["mAR"],
+        "mAF1": metrics["mAF1"],
+        "wF1": metrics["wF1"],
     }
 
-    with open(args.save_metrics, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-
-    logging.info(
-        "Overall: Acc=%.6f | mAP=%.6f | mAR=%.6f | mAF1=%.6f | wF1=%.6f",
-        metrics["acc"],
-        metrics["mAP"],
-        metrics["mAR"],
-        metrics["mAF1"],
-        metrics["wF1"],
-    )
-    logging.info("Any-match Acc: %.6f", anymatch_acc)
-    logging.info("Total samples: %d", len(dataset))
-    logging.info("Evaluated samples: %d", len(y_true))
-    logging.info("unknown_pred_ratio: %.6f", unknown_pred_ratio)
-    logging.info("Pred top20 distribution: %s", pred_topk)
-    logging.info("GT top20 distribution: %s", gt_topk)
-    logging.info("Match type distribution: %s", dict(match_type_counts))
-    logging.info("Most common confusions (top30): %s", confusion_topk)
+    logging.info("Summary: %s", summary)
     logging.info("Saved predictions: %s", args.predictions_file)
-    logging.info("Saved metrics: %s", args.save_metrics)
 
 
 def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("SurgViVQA evaluation on SSGVQA static QA (LLaVA-Med style)")
+    parser = argparse.ArgumentParser("SurgViVQA evaluation on SSGVQA static QA")
 
     parser.add_argument("--model-path", required=True, help="Path to SurgViVQA checkpoint (.pth)")
     parser.add_argument("--ssgvqa-root", required=True, help="Root of SSGVQA static QA txt files")
@@ -904,35 +656,22 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--num-frames", type=int, default=16)
 
-    parser.add_argument("--max-prompt-len", type=int, default=256)
+    parser.add_argument("--prompt-mode", type=str, default="simple", choices=["simple", "choices"])
+    parser.add_argument("--max-input-tokens", type=int, default=256)
     parser.add_argument("--max-new-tokens", type=int, default=16)
-    parser.add_argument(
-        "--decode-mode",
-        type=str,
-        default="greedy",
-        choices=["greedy", "closed"],
-        help="greedy=raw generation only; closed=map to label set (still keeps raw).",
-    )
-    parser.add_argument(
-        "--prompt-style",
-        type=str,
-        default="freeform",
-        choices=["freeform", "label_only"],
-        help="Prompt style aligned with LLaVA-Med (freeform recommended for raw generation).",
-    )
+    parser.add_argument("--do-sample", action="store_true")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--num-beams", type=int, default=1)
 
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--strict-missing-image", action="store_true")
 
     parser.add_argument("--debug-first-n", type=int, default=None)
-    parser.add_argument("--ablate-image", action="store_true")
-    parser.add_argument("--ablate-text", action="store_true")
-    parser.add_argument("--ablate-text-prompt", type=str, default="What is shown?")
     parser.add_argument("--log-every-n", type=int, default=200)
 
     parser.add_argument("--log-file", required=True)
     parser.add_argument("--predictions-file", required=True)
-    parser.add_argument("--save-metrics", required=True)
     parser.add_argument("--seed", type=int, default=42)
 
     return parser.parse_args()
