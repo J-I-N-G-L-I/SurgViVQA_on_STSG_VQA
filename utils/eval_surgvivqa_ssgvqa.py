@@ -1,10 +1,10 @@
 """
-SurgViVQA evaluation on SSGVQA static QA.
+SurgViVQA evaluation on SSGVQA static QA (closed-set label scoring).
 
 Key goals:
-- Always log full raw generation text.
 - Ensure images tensor shape is [B, T, 3, H, W].
 - Support prompt modes: simple vs choices.
+- Closed-set scoring over SSGVQA labels (no free-form generation).
 """
 
 import argparse
@@ -191,18 +191,16 @@ def compute_metrics(y_true: List[int], y_pred: List[int], num_classes: int) -> D
     return {"acc": acc, "mAP": mAP, "mAR": mAR, "mAF1": mAF1, "wF1": wF1}
 
 
-def build_prompt(question: str, mode: str) -> str:
+def build_prompt_prefix(question: str, mode: str) -> str:
     q = (question or "").strip()
     if mode == "choices":
         candidates = ", ".join(SSGVQA_LABELS)
         return (
-            "You are given a surgical image. Choose the best answer from the candidate list.\n"
-            f"Candidates: {candidates}\n"
             f"Question: {q}\n"
+            f"Candidates: {candidates}\n"
             "Answer:"
         )
     return (
-        "You are given a surgical image. Answer the question based on the image. Answer concisely.\n"
         f"Question: {q}\n"
         "Answer:"
     )
@@ -223,159 +221,135 @@ def to_chw_frame(pixel_values: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unexpected pixel_values shape: {tuple(pixel_values.shape)}")
 
 
-def _get_original_lengths(tokenizer, prompts: List[str]) -> List[int]:
-    try:
-        raw = tokenizer(prompts, padding=False, truncation=False, return_length=True)
-        if "length" in raw:
-            return [int(x) for x in raw["length"]]
-    except TypeError:
-        pass
-    lengths = []
-    for p in prompts:
-        enc = tokenizer(p, padding=False, truncation=False)
-        lengths.append(len(enc["input_ids"]))
-    return lengths
-
-
-def generate_outputs(
-    model,
+def _tokenize_prefixes(
     tokenizer,
-    videos: torch.Tensor,
-    prompts: List[str],
+    prompt_prefixes: List[str],
     max_input_tokens: int,
-    max_new_tokens: int,
-    do_sample: bool,
-    temperature: float,
-    top_p: float,
-    num_beams: int,
-    device,
 ):
-    if num_beams != 1:
-        logging.warning("num_beams > 1 not supported in autoregressive mode; using greedy decoding.")
-        num_beams = 1
     tok = tokenizer(
-        prompts,
+        prompt_prefixes,
         padding=True,
         truncation=True,
         max_length=max_input_tokens,
         return_tensors="pt",
     )
-    input_ids = tok["input_ids"].to(device)
-    attn_mask = tok["attention_mask"].to(device)
+    input_ids = tok["input_ids"]
+    attn_mask = tok["attention_mask"]
+    return tok, input_ids, attn_mask
+
+
+def _normalize_label_token_ids(tokenizer, labels: List[str]) -> List[List[int]]:
+    label_ids = []
+    for lbl in labels:
+        text = " " + str(lbl)
+        enc = tokenizer(text, add_special_tokens=False)
+        label_ids.append(enc["input_ids"])
+    return label_ids
+
+
+def score_labels_closedset(
+    model,
+    tokenizer,
+    videos: torch.Tensor,
+    prompt_prefixes: List[str],
+    labels: List[str],
+    max_input_tokens: int,
+    device,
+    label_chunk_size: int = 10,
+):
+    tok, input_ids, attn_mask = _tokenize_prefixes(tokenizer, prompt_prefixes, max_input_tokens)
+    input_ids = input_ids.to(device)
+    attn_mask = attn_mask.to(device)
     prompt_lens = attn_mask.sum(dim=1).long()
 
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    eos_id = tokenizer.eos_token_id
 
     video_embeds, video_atts = model.encode_video(videos.to(device))
-    text_out = model.text_encoder(
-        input_ids=input_ids,
-        attention_mask=attn_mask,
-        encoder_hidden_states=video_embeds,
-        encoder_attention_mask=video_atts,
-        return_dict=True,
-    )
-    text_embeds = text_out.last_hidden_state
+
+    label_token_ids = _normalize_label_token_ids(tokenizer, labels)
 
     bsz = input_ids.size(0)
-    cur_ids = input_ids
-    cur_att = attn_mask
-    finished = torch.zeros(bsz, dtype=torch.bool, device=device)
-    generated = []
+    num_labels = len(labels)
+    scores = torch.full((bsz, num_labels), -1e9, device=device, dtype=torch.float32)
+    trunc_flags = torch.zeros(bsz, dtype=torch.bool, device=device)
 
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
+    for start in range(0, num_labels, label_chunk_size):
+        end = min(start + label_chunk_size, num_labels)
+        chunk_ids = label_token_ids[start:end]
+
+        max_label_len = max((len(x) for x in chunk_ids), default=0)
+        if max_label_len == 0:
+            continue
+
+        label_ids = torch.full((end - start, max_label_len), pad_id, dtype=torch.long, device=device)
+        label_att = torch.zeros((end - start, max_label_len), dtype=torch.long, device=device)
+        for i, ids in enumerate(chunk_ids):
+            if not ids:
+                continue
+            label_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+            label_att[i, : len(ids)] = 1
+
+        # Expand prompts for label chunk
+        exp_input_ids = input_ids.unsqueeze(1).expand(bsz, end - start, -1).contiguous()
+        exp_att = attn_mask.unsqueeze(1).expand(bsz, end - start, -1).contiguous()
+
+        exp_label_ids = label_ids.unsqueeze(0).expand(bsz, -1, -1).contiguous()
+        exp_label_att = label_att.unsqueeze(0).expand(bsz, -1, -1).contiguous()
+
+        concat_ids = torch.cat([exp_input_ids, exp_label_ids], dim=2)
+        concat_att = torch.cat([exp_att, exp_label_att], dim=2)
+
+        # Truncation handling
+        concat_len = concat_att.sum(dim=2)
+        trunc = concat_len > max_input_tokens
+        trunc_flags = trunc_flags | trunc.any(dim=1)
+
+        if concat_ids.size(2) > max_input_tokens:
+            concat_ids = concat_ids[:, :, :max_input_tokens]
+            concat_att = concat_att[:, :, :max_input_tokens]
+
+        flat_ids = concat_ids.view(bsz * (end - start), -1)
+        flat_att = concat_att.view(bsz * (end - start), -1)
+
+        with torch.no_grad():
             logits = model(
                 video=None,
-                qa_inputs_ids=cur_ids,
-                qa_att_mask=cur_att,
+                qa_inputs_ids=flat_ids,
+                qa_att_mask=flat_att,
                 video_embeds=video_embeds,
                 video_atts=video_atts,
             )
-            next_logits = logits[:, -1, :]
 
-            if do_sample:
-                temp = max(float(temperature), 1e-6)
-                probs = torch.softmax(next_logits / temp, dim=-1)
-                if top_p < 1.0:
-                    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-                    cum = sorted_probs.cumsum(dim=-1)
-                    mask = cum > float(top_p)
-                    mask[:, 0] = False
-                    sorted_probs = sorted_probs.masked_fill(mask, 0.0)
-                    sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-                    next_ids = torch.multinomial(sorted_probs, num_samples=1).squeeze(1)
-                    next_ids = sorted_idx.gather(1, next_ids.unsqueeze(1)).squeeze(1)
-                else:
-                    next_ids = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_ids = torch.argmax(next_logits, dim=-1)
+        log_probs = torch.log_softmax(logits, dim=-1)
 
-            if eos_id is not None:
-                next_ids = torch.where(finished, torch.tensor(pad_id, device=device), next_ids)
-                finished = finished | (next_ids == eos_id)
+        # Compute label token log-prob sum (teacher-forcing)
+        seq_len = flat_ids.size(1)
+        shifted_log_probs = log_probs[:, :-1, :]
+        shifted_ids = flat_ids[:, 1:]
 
-            generated.append(next_ids)
-            next_att = (~finished).long()
-            cur_ids = torch.cat([cur_ids, next_ids.unsqueeze(1)], dim=1)
-            cur_att = torch.cat([cur_att, next_att.unsqueeze(1)], dim=1)
+        flat_prompt_lens = prompt_lens.unsqueeze(1).expand(bsz, end - start).reshape(-1)
+        label_scores = torch.zeros(bsz * (end - start), device=device, dtype=torch.float32)
 
-            if bool(finished.all()):
-                break
+        for i in range(bsz * (end - start)):
+            pl = int(flat_prompt_lens[i].item())
+            # label tokens start right after prompt
+            start_pos = max(pl - 1, 0)
+            end_pos = min(pl - 1 + max_label_len, seq_len - 1)
+            if end_pos <= start_pos:
+                continue
+            token_ids = shifted_ids[i, start_pos:end_pos]
+            token_att = flat_att[i, 1:][start_pos:end_pos]
+            if token_att.sum().item() == 0:
+                continue
+            lp = shifted_log_probs[i, start_pos:end_pos, :].gather(1, token_ids.unsqueeze(1)).squeeze(1)
+            lp = lp * token_att
+            label_scores[i] = lp.sum()
 
-    if generated:
-        gen_only = torch.stack(generated, dim=1)
-    else:
-        gen_only = torch.empty((bsz, 0), dtype=torch.long, device=device)
+        label_scores = label_scores.view(bsz, end - start)
+        scores[:, start:end] = label_scores
 
-    gen_ids = torch.cat([input_ids, gen_only], dim=1)
-
-    # ---- Debug logging (first sample) ----
-    input_len = int(attn_mask[0].sum().item())
-    gen_seq_len = int(gen_ids.shape[1])
-    if gen_seq_len > int(prompt_lens[0].item()):
-        debug_gen = gen_ids[0, int(prompt_lens[0].item()):].tolist()
-    else:
-        debug_gen = gen_ids[0, :].tolist()
-    while debug_gen and pad_id is not None and debug_gen[0] == pad_id:
-        debug_gen = debug_gen[1:]
-    first_generated_is_eos = bool(debug_gen and eos_id is not None and debug_gen[0] == eos_id)
-    debug_head_ids = debug_gen[:20]
-    debug_head_text = tokenizer.decode(debug_head_ids, skip_special_tokens=True)
-
-    logging.info("[GenDebug] input_ids.shape=%s", tuple(input_ids.shape))
-    logging.info("[GenDebug] text_embeds.shape=%s", tuple(text_embeds.shape))
-    logging.info("[GenDebug] gen_ids.shape=%s", tuple(gen_ids.shape))
-    logging.info("[GenDebug] input_len=%d | gen_seq_len=%d", input_len, gen_seq_len)
-    logging.info("[GenDebug] prompt_len=%d", int(prompt_lens[0].item()))
-    logging.info("[GenDebug] first_generated_is_eos=%s", first_generated_is_eos)
-    logging.info("[GenDebug] decode_ids_head=%s", debug_head_ids)
-    logging.info("[GenDebug] decode_text_head=%s", debug_head_text.replace("\n", "\\n"))
-
-    outputs: List[str] = []
-    output_token_lens: List[int] = []
-    for i in range(bsz):
-        if gen_ids.shape[1] > int(prompt_lens[i].item()):
-            seq = gen_ids[i, int(prompt_lens[i].item()):].tolist()
-        else:
-            seq = gen_ids[i, :].tolist()
-
-        while seq and pad_id is not None and seq[0] == pad_id:
-            seq = seq[1:]
-
-        eos_immediate = bool(seq and eos_id is not None and seq[0] == eos_id)
-        if eos_immediate:
-            outputs.append("<EOS_IMMEDIATE>")
-            output_token_lens.append(0)
-            continue
-
-        if eos_id is not None and eos_id in seq:
-            seq = seq[: seq.index(eos_id)]
-
-        output_token_lens.append(len(seq))
-        outputs.append(tokenizer.decode(seq, skip_special_tokens=True).strip())
-
-    return tok, outputs, output_token_lens
+    tokenized_lens = attn_mask.sum(dim=1).tolist()
+    return scores, tokenized_lens, trunc_flags.tolist()
 
 
 # -----------------------------
@@ -588,12 +562,12 @@ def evaluate(args) -> None:
     logging.info("Total samples: %d", len(dataset))
 
     total_samples = 0
-    empty_output_count = 0
-    total_output_tokens = 0
     total_prompt_tokens = 0
     truncated_count = 0
     y_true: List[int] = []
     y_pred: List[int] = []
+    y_true_any: List[int] = []
+    y_pred_any: List[int] = []
     exact_map, norm_map = build_label_maps(SSGVQA_LABELS)
 
     with open(args.predictions_file, "w", encoding="utf-8") as fout:
@@ -607,28 +581,21 @@ def evaluate(args) -> None:
                 if processed == 0:
                     logging.info("Images tensor shape: %s", tuple(videos.shape))
 
-                prompts = [build_prompt(q, args.prompt_mode) for q in questions]
-                orig_lens = _get_original_lengths(tokenizer, prompts)
-                tok, raw_preds, output_token_lens = generate_outputs(
+                prompt_prefixes = [build_prompt_prefix(q, args.prompt_mode) for q in questions]
+                scores, tokenized_lens, truncated_flags = score_labels_closedset(
                     model=model,
                     tokenizer=tokenizer,
                     videos=videos,
-                    prompts=prompts,
+                    prompt_prefixes=prompt_prefixes,
+                    labels=SSGVQA_LABELS,
                     max_input_tokens=args.max_input_tokens,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=args.do_sample,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    num_beams=args.num_beams,
                     device=device,
+                    label_chunk_size=args.label_chunk_size,
                 )
 
-                tokenized_lens = tok["attention_mask"].sum(dim=1).tolist()
-                truncated_flags = [int(orig_lens[i] > args.max_input_tokens) for i in range(len(prompts))]
-
                 if (args.debug_first_n is not None) or (processed == 0):
-                    head = prompts[0][:120].replace("\n", "\\n")
-                    tail = prompts[0][-120:].replace("\n", "\\n")
+                    head = prompt_prefixes[0][:120].replace("\n", "\\n")
+                    tail = prompt_prefixes[0][-120:].replace("\n", "\\n")
                     logging.info(
                         "tokenized_len=%d | truncated=%s | max_input_tokens=%d",
                         int(tokenized_lens[0]),
@@ -638,34 +605,49 @@ def evaluate(args) -> None:
                     logging.info("prompt head: %s", head)
                     logging.info("prompt tail: %s", tail)
 
-                for i, (q, gt, vid, fid, ip, pred_raw) in enumerate(
-                    zip(questions, answers, vids, frames, img_paths, raw_preds)
+                if any(truncated_flags):
+                    logging.warning("Truncation occurred in batch (max_input_tokens=%d).", int(args.max_input_tokens))
+
+                for i, (q, gt, vid, fid, ip) in enumerate(
+                    zip(questions, answers, vids, frames, img_paths)
                 ):
                     gt_label = gt.strip()
                     gt_labels = [s.strip() for s in gt_label.split(",") if s.strip()]
-                    gt_idx = -1
+                    gt_idx_first = -1
+                    gt_idx_any = -1
                     if gt_labels:
                         for candidate in gt_labels:
                             mapped_label, mapped_idx = map_pred_to_label(candidate, SSGVQA_LABELS, exact_map, norm_map)
                             if mapped_idx != -1:
-                                gt_idx = mapped_idx
+                                if gt_idx_first == -1:
+                                    gt_idx_first = mapped_idx
+                                gt_idx_any = mapped_idx
                                 break
 
-                    pred_label, pred_idx = map_pred_to_label(pred_raw, SSGVQA_LABELS, exact_map, norm_map)
+                    row_scores = scores[i].detach().cpu()
+                    pred_idx = int(torch.argmax(row_scores).item())
+                    pred_label = SSGVQA_LABELS[pred_idx]
+
                     tokenized_len = int(tokenized_lens[i])
                     truncated = bool(truncated_flags[i])
-                    output_token_len = int(output_token_lens[i])
 
                     total_samples += 1
-                    total_output_tokens += output_token_len
                     total_prompt_tokens += tokenized_len
                     if truncated:
                         truncated_count += 1
-                    if not pred_raw:
-                        empty_output_count += 1
-                    if gt_idx != -1 and pred_idx != -1:
-                        y_true.append(gt_idx)
+                    if gt_idx_first != -1:
+                        y_true.append(gt_idx_first)
                         y_pred.append(pred_idx)
+                    if gt_idx_any != -1:
+                        y_true_any.append(gt_idx_any)
+                        y_pred_any.append(pred_idx)
+
+                    topk = min(5, len(SSGVQA_LABELS))
+                    top_scores, top_indices = torch.topk(row_scores, k=topk, largest=True)
+                    top5 = [
+                        {"label": SSGVQA_LABELS[int(idx)], "score": float(sc)}
+                        for sc, idx in zip(top_scores.tolist(), top_indices.tolist())
+                    ]
 
                     # Store JSONL record
                     fout.write(
@@ -677,13 +659,13 @@ def evaluate(args) -> None:
                                 "question": q,
                                 "gt_answer": gt_label,
                                 "prompt_mode": args.prompt_mode,
-                                "prompt_used": prompts[i],
-                                "raw_pred_text": pred_raw,
+                                "prompt_prefix": prompt_prefixes[i],
                                 "tokenized_len": tokenized_len,
                                 "truncated": truncated,
                                 "max_input_tokens": int(args.max_input_tokens),
-                                "max_new_tokens": int(args.max_new_tokens),
-                                "output_token_len": output_token_len,
+                                "pred_label": pred_label,
+                                "pred_idx": pred_idx,
+                                "top5": top5,
                             },
                             ensure_ascii=False,
                         )
@@ -693,25 +675,22 @@ def evaluate(args) -> None:
                     if args.log_every_n > 0 and processed % args.log_every_n == 0:
                         logging.info("Sample q: %s", q)
                         logging.info("Sample gt: %s", gt_label)
-                        logging.info("Sample pred raw: %s", pred_raw)
+                        logging.info("Sample pred label: %s", pred_label)
                         logging.info("Sample tokenized_len: %d", tokenized_len)
-                        logging.info("Sample output_token_len: %d", output_token_len)
+                        logging.info("Sample truncated: %s", truncated)
 
                     processed += 1
                     if args.debug_first_n is not None and processed >= args.debug_first_n:
                         break
 
     num_samples = int(total_samples)
-    empty_output_ratio = float(empty_output_count) / float(max(1, total_samples))
-    avg_output_token_len = float(total_output_tokens) / float(max(1, total_samples))
     avg_prompt_token_len = float(total_prompt_tokens) / float(max(1, total_samples))
     truncated_ratio = float(truncated_count) / float(max(1, total_samples))
 
     metrics = compute_metrics(y_true, y_pred, num_classes=len(SSGVQA_LABELS))
+    metrics_any = compute_metrics(y_true_any, y_pred_any, num_classes=len(SSGVQA_LABELS))
     summary = {
         "num_samples": num_samples,
-        "empty_output_ratio": empty_output_ratio,
-        "avg_output_token_len": avg_output_token_len,
         "avg_prompt_token_len": avg_prompt_token_len,
         "truncated_ratio": truncated_ratio,
         "acc": metrics["acc"],
@@ -719,6 +698,11 @@ def evaluate(args) -> None:
         "mAR": metrics["mAR"],
         "mAF1": metrics["mAF1"],
         "wF1": metrics["wF1"],
+        "acc_any": metrics_any["acc"],
+        "mAP_any": metrics_any["mAP"],
+        "mAR_any": metrics_any["mAR"],
+        "mAF1_any": metrics_any["mAF1"],
+        "wF1_any": metrics_any["wF1"],
     }
 
     logging.info("Summary: %s", summary)
@@ -739,11 +723,7 @@ def get_args() -> argparse.Namespace:
 
     parser.add_argument("--prompt-mode", type=str, default="simple", choices=["simple", "choices"])
     parser.add_argument("--max-input-tokens", type=int, default=256)
-    parser.add_argument("--max-new-tokens", type=int, default=16)
-    parser.add_argument("--do-sample", action="store_true")
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--num-beams", type=int, default=1)
+    parser.add_argument("--label-chunk-size", type=int, default=10)
 
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--strict-missing-image", action="store_true")

@@ -29,8 +29,10 @@ CKPT_PATH=/mnt/scratch/sc232jl/SurgViVQA/checkpoints/surgvivqa_gpt2_endovis_ckpt
 SSGVQA_ROOT=/mnt/scratch/sc232jl/datasets/SSGVQA/ssg-qa
 IMAGE_ROOT=/mnt/scratch/sc232jl/datasets/CholecT45/data
 
-LOG_FILE=logs/ssgvqa_eval_${SLURM_JOB_ID}.log
-PRED_FILE=logs/ssgvqa_predictions_${SLURM_JOB_ID}.jsonl
+LOG_FILE_SIMPLE=logs/ssgvqa_eval_${SLURM_JOB_ID}_simple.log
+PRED_FILE_SIMPLE=logs/ssgvqa_predictions_${SLURM_JOB_ID}_simple.jsonl
+LOG_FILE_CHOICES=logs/ssgvqa_eval_${SLURM_JOB_ID}_choices.log
+PRED_FILE_CHOICES=logs/ssgvqa_predictions_${SLURM_JOB_ID}_choices.jsonl
 
 # ----------------------------------------------
 # Example 1: simple prompt (short, natural QA)
@@ -40,14 +42,13 @@ python utils/eval_surgvivqa_ssgvqa.py \
   --ssgvqa-root ${SSGVQA_ROOT} \
   --image-root ${IMAGE_ROOT} \
   --videos VID02 VID22 VID43 VID60 VID74 \
-  --log-file ${LOG_FILE} \
-  --predictions-file ${PRED_FILE} \
+  --log-file ${LOG_FILE_SIMPLE} \
+  --predictions-file ${PRED_FILE_SIMPLE} \
   --batch-size 4 \
   --workers 4 \
   --num-frames 16 \
   --prompt-mode simple \
   --max-input-tokens 128 \
-  --max-new-tokens 32 \
   --log-every-n 200
 
 # --------------------------------------------------------
@@ -61,12 +62,11 @@ python utils/eval_surgvivqa_ssgvqa.py \
   --ssgvqa-root ${SSGVQA_ROOT} \
   --image-root ${IMAGE_ROOT} \
   --videos VID02 VID22 VID43 VID60 VID74 \
-  --log-file ${LOG_FILE} \
-  --predictions-file ${PRED_FILE} \
+  --log-file ${LOG_FILE_CHOICES} \
+  --predictions-file ${PRED_FILE_CHOICES} \
   --batch-size 4 \
   --workers 4 \
   --num-frames 16 \
   --prompt-mode choices \
   --max-input-tokens 512 \
-  --max-new-tokens 16 \
   --log-every-n 200
