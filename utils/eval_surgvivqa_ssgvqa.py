@@ -221,21 +221,30 @@ def to_chw_frame(pixel_values: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unexpected pixel_values shape: {tuple(pixel_values.shape)}")
 
 
-def _tokenize_prefixes(
+def _tokenize_prefixes_no_pad(
     tokenizer,
     prompt_prefixes: List[str],
     max_input_tokens: int,
-):
-    tok = tokenizer(
-        prompt_prefixes,
-        padding=True,
-        truncation=True,
-        max_length=max_input_tokens,
-        return_tensors="pt",
-    )
-    input_ids = tok["input_ids"]
-    attn_mask = tok["attention_mask"]
-    return tok, input_ids, attn_mask
+) -> Tuple[List[List[int]], List[int]]:
+    """
+    Tokenize prefixes WITHOUT padding.
+    Returns:
+        prefix_ids_list: List[List[int]] - token ids for each prefix
+        prefix_lens: List[int] - actual length of each prefix
+    """
+    prefix_ids_list = []
+    prefix_lens = []
+    for prefix in prompt_prefixes:
+        enc = tokenizer(
+            prefix,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_input_tokens,
+        )
+        ids = enc["input_ids"]
+        prefix_ids_list.append(ids)
+        prefix_lens.append(len(ids))
+    return prefix_ids_list, prefix_lens
 
 
 def _normalize_label_token_ids(tokenizer, labels: List[str]) -> List[List[int]]:
@@ -256,21 +265,27 @@ def score_labels_closedset(
     max_input_tokens: int,
     device,
     label_chunk_size: int = 10,
+    score_norm: str = "mean",
 ):
     """
     Closed-set scoring: for each sample and each label, compute teacher-forcing log-prob.
+    
+    FIX: Constructs seq_ids = prefix_ids + label_ids for each sample+label pair,
+    ensuring label tokens are immediately after the prefix (no pad gap).
+    
+    Args:
+        score_norm: "sum" for raw logprob sum, "mean" for length-normalized (default).
+    
     Returns:
         scores: [B, num_labels]
-        tokenized_lens: list of prompt token lengths
+        tokenized_lens: list of prompt token lengths (actual, not padded)
         trunc_flags: list of bool indicating truncation
         label_tokens_scored: [B, num_labels] actual label tokens scored per sample/label
-        max_label_lens: [num_labels] max token length per label (for diagnostics)
+        label_token_lens: [num_labels] token length per label (for diagnostics)
     """
-    tok, input_ids, attn_mask = _tokenize_prefixes(tokenizer, prompt_prefixes, max_input_tokens)
-    input_ids = input_ids.to(device)
-    attn_mask = attn_mask.to(device)
-    prompt_lens = attn_mask.sum(dim=1).long()
-
+    # Tokenize prefixes WITHOUT padding to get actual prefix lengths
+    prefix_ids_list, prefix_lens = _tokenize_prefixes_no_pad(tokenizer, prompt_prefixes, max_input_tokens)
+    
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     video_embeds, video_atts = model.encode_video(videos.to(device))
@@ -278,54 +293,55 @@ def score_labels_closedset(
     label_token_ids = _normalize_label_token_ids(tokenizer, labels)
     label_token_lens = [len(ids) for ids in label_token_ids]
 
-    bsz = input_ids.size(0)
+    bsz = len(prompt_prefixes)
     num_labels = len(labels)
     scores = torch.full((bsz, num_labels), -1e9, device=device, dtype=torch.float32)
     label_tokens_scored = torch.zeros((bsz, num_labels), device=device, dtype=torch.long)
-    trunc_flags = torch.zeros(bsz, dtype=torch.bool, device=device)
+    trunc_flags = [False] * bsz
 
     for start in range(0, num_labels, label_chunk_size):
         end = min(start + label_chunk_size, num_labels)
         chunk_size = end - start
-        chunk_ids = label_token_ids[start:end]
+        chunk_label_ids = label_token_ids[start:end]
+        chunk_label_lens = label_token_lens[start:end]
 
-        max_label_len = max((len(x) for x in chunk_ids), default=0)
-        if max_label_len == 0:
-            continue
-
-        label_ids = torch.full((chunk_size, max_label_len), pad_id, dtype=torch.long, device=device)
-        label_att = torch.zeros((chunk_size, max_label_len), dtype=torch.long, device=device)
-        for i, ids in enumerate(chunk_ids):
-            if not ids:
-                continue
-            label_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-            label_att[i, : len(ids)] = 1
-
-        # Expand prompts for label chunk
-        exp_input_ids = input_ids.unsqueeze(1).expand(bsz, chunk_size, -1).contiguous()
-        exp_att = attn_mask.unsqueeze(1).expand(bsz, chunk_size, -1).contiguous()
-
-        exp_label_ids = label_ids.unsqueeze(0).expand(bsz, -1, -1).contiguous()
-        exp_label_att = label_att.unsqueeze(0).expand(bsz, -1, -1).contiguous()
-
-        concat_ids = torch.cat([exp_input_ids, exp_label_ids], dim=2)
-        concat_att = torch.cat([exp_att, exp_label_att], dim=2)
-
-        # Truncation handling
-        concat_len = concat_att.sum(dim=2)
-        trunc = concat_len > max_input_tokens
-        trunc_flags = trunc_flags | trunc.any(dim=1)
-
-        if concat_ids.size(2) > max_input_tokens:
-            concat_ids = concat_ids[:, :, :max_input_tokens]
-            concat_att = concat_att[:, :, :max_input_tokens]
-
-        flat_ids = concat_ids.view(bsz * chunk_size, -1)
-        flat_att = concat_att.view(bsz * chunk_size, -1)
-
-        # ---- Fix 1: Expand video_embeds/video_atts to match flat batch [B*chunk_size, ...] ----
-        # video_embeds: [B, V, D] -> [B, chunk_size, V, D] -> [B*chunk_size, V, D]
-        # video_atts:   [B, V]    -> [B, chunk_size, V]    -> [B*chunk_size, V]
+        # Build all sequences: for each sample i and each label j in chunk,
+        # seq[i,j] = prefix_ids[i] + label_ids[j]
+        all_seqs = []
+        all_prefix_lens_flat = []
+        all_label_lens_flat = []
+        trunc_in_chunk = []
+        
+        for i in range(bsz):
+            p_ids = prefix_ids_list[i]
+            p_len = prefix_lens[i]
+            for j, l_ids in enumerate(chunk_label_ids):
+                l_len = chunk_label_lens[j]
+                # Concatenate prefix + label (label immediately follows prefix)
+                seq_ids = p_ids + l_ids
+                total_len = len(seq_ids)
+                
+                # Check truncation
+                truncated = total_len > max_input_tokens
+                if truncated:
+                    seq_ids = seq_ids[:max_input_tokens]
+                    trunc_flags[i] = True
+                
+                trunc_in_chunk.append(truncated)
+                all_seqs.append(torch.tensor(seq_ids, dtype=torch.long, device=device))
+                all_prefix_lens_flat.append(p_len)
+                all_label_lens_flat.append(l_len)
+        
+        # Pad sequences to same length using pad_sequence
+        flat_ids = torch.nn.utils.rnn.pad_sequence(
+            all_seqs, batch_first=True, padding_value=pad_id
+        )  # [B*chunk_size, max_seq_len]
+        
+        # Build attention mask (1 for real tokens, 0 for padding)
+        flat_att = (flat_ids != pad_id).long()
+        
+        # Expand video embeddings for flattened batch
+        # video_embeds: [B, V, D] -> [B*chunk_size, V, D]
         video_embeds_exp = video_embeds.unsqueeze(1).expand(bsz, chunk_size, -1, -1).contiguous()
         video_embeds_exp = video_embeds_exp.view(bsz * chunk_size, video_embeds.size(1), video_embeds.size(2))
         video_atts_exp = video_atts.unsqueeze(1).expand(bsz, chunk_size, -1).contiguous()
@@ -342,39 +358,56 @@ def score_labels_closedset(
 
         log_probs = torch.log_softmax(logits, dim=-1)
 
-        # Compute label token log-prob sum (teacher-forcing)
+        # Compute label token log-prob (teacher-forcing)
+        # For position p in seq, logits[p] predicts token at p+1
+        # So to score label tokens at positions [prefix_len, prefix_len + label_len),
+        # we use logits at positions [prefix_len - 1, prefix_len + label_len - 1)
         seq_len = flat_ids.size(1)
-        shifted_log_probs = log_probs[:, :-1, :]
-        shifted_ids = flat_ids[:, 1:]
+        shifted_log_probs = log_probs[:, :-1, :]  # [B*chunk, seq_len-1, vocab]
+        shifted_ids = flat_ids[:, 1:]  # [B*chunk, seq_len-1]
 
-        flat_prompt_lens = prompt_lens.unsqueeze(1).expand(bsz, chunk_size).reshape(-1)
         chunk_label_scores = torch.zeros(bsz * chunk_size, device=device, dtype=torch.float32)
-        chunk_tokens_scored = torch.zeros(bsz * chunk_size, device=device, dtype=torch.long)
+        chunk_tokens_scored_flat = torch.zeros(bsz * chunk_size, device=device, dtype=torch.long)
 
-        for i in range(bsz * chunk_size):
-            pl = int(flat_prompt_lens[i].item())
-            # label tokens start right after prompt
-            start_pos = max(pl - 1, 0)
-            end_pos = min(pl - 1 + max_label_len, seq_len - 1)
-            if end_pos <= start_pos:
+        for idx in range(bsz * chunk_size):
+            p_len = all_prefix_lens_flat[idx]
+            l_len = all_label_lens_flat[idx]
+            
+            # Label tokens are at positions [p_len, p_len + l_len) in the sequence
+            # To predict token at position p_len, we use logits at position p_len - 1
+            start_pos = p_len - 1  # Start of scoring window in shifted tensors
+            end_pos = min(p_len - 1 + l_len, seq_len - 1)  # End of scoring window
+            
+            if end_pos <= start_pos or start_pos < 0:
                 continue
-            token_ids = shifted_ids[i, start_pos:end_pos]
-            token_att = flat_att[i, 1:][start_pos:end_pos]
-            num_valid = int(token_att.sum().item())
-            chunk_tokens_scored[i] = num_valid
+            
+            # Get the label token ids we want to score
+            target_ids = shifted_ids[idx, start_pos:end_pos]
+            # Create mask for valid (non-truncated) label positions
+            valid_len = end_pos - start_pos
+            num_valid = min(valid_len, l_len)
+            
             if num_valid == 0:
                 continue
-            lp = shifted_log_probs[i, start_pos:end_pos, :].gather(1, token_ids.unsqueeze(1)).squeeze(1)
-            lp = lp * token_att
-            chunk_label_scores[i] = lp.sum()
+            
+            chunk_tokens_scored_flat[idx] = num_valid
+            
+            # Gather log probs for target tokens
+            lp = shifted_log_probs[idx, start_pos:start_pos + num_valid, :]
+            lp = lp.gather(1, target_ids[:num_valid].unsqueeze(1)).squeeze(1)
+            
+            sum_lp = lp.sum()
+            if score_norm == "mean" and num_valid > 0:
+                chunk_label_scores[idx] = sum_lp / num_valid
+            else:
+                chunk_label_scores[idx] = sum_lp
 
         chunk_label_scores = chunk_label_scores.view(bsz, chunk_size)
-        chunk_tokens_scored = chunk_tokens_scored.view(bsz, chunk_size)
+        chunk_tokens_scored_flat = chunk_tokens_scored_flat.view(bsz, chunk_size)
         scores[:, start:end] = chunk_label_scores
-        label_tokens_scored[:, start:end] = chunk_tokens_scored
+        label_tokens_scored[:, start:end] = chunk_tokens_scored_flat
 
-    tokenized_lens = attn_mask.sum(dim=1).tolist()
-    return scores, tokenized_lens, trunc_flags.tolist(), label_tokens_scored, label_token_lens
+    return scores, prefix_lens, trunc_flags, label_tokens_scored, label_token_lens
 
 
 # -----------------------------
@@ -616,11 +649,14 @@ def evaluate(args) -> None:
     total_prompt_tokens = 0
     truncated_count = 0
     zero_label_tokens_count = 0
+    all_label_tokens_scored: List[int] = []  # For diagnostics
     y_true: List[int] = []
     y_pred: List[int] = []
     anymatch_correct = 0
     anymatch_total = 0
     exact_map, norm_map = build_label_maps(SSGVQA_LABELS)
+
+    logging.info("[Config] score_norm=%s", args.score_norm)
 
     with open(args.predictions_file, "w", encoding="utf-8") as fout:
         model.eval()
@@ -643,6 +679,7 @@ def evaluate(args) -> None:
                     max_input_tokens=args.max_input_tokens,
                     device=device,
                     label_chunk_size=args.label_chunk_size,
+                    score_norm=args.score_norm,
                 )
 
                 if (args.debug_first_n is not None) or (processed == 0):
@@ -688,18 +725,23 @@ def evaluate(args) -> None:
                     max_label_len_in_batch = max(label_token_lens)
                     estimated_concat_len = tokenized_len + max_label_len_in_batch
 
+                    # Get label length for the predicted label
+                    pred_label_len = label_token_lens[pred_idx]
+
                     total_samples += 1
                     total_prompt_tokens += tokenized_len
+                    all_label_tokens_scored.append(pred_label_tokens_scored)
                     if truncated:
                         truncated_count += 1
                     if pred_label_tokens_scored == 0:
                         zero_label_tokens_count += 1
                         logging.warning(
                             "[WARN] Sample %d: label_tokens_scored=0 for pred_label=%s. "
-                            "Score may be meaningless due to truncation. prefix_len=%d, max_label_len=%d, max_input_tokens=%d",
+                            "prefix_len=%d, label_len=%d, max_label_len_batch=%d, max_input_tokens=%d",
                             processed,
                             pred_label,
                             tokenized_len,
+                            pred_label_len,
                             max_label_len_in_batch,
                             args.max_input_tokens,
                         )
@@ -732,8 +774,10 @@ def evaluate(args) -> None:
                                 "question": q,
                                 "gt_answer": gt_label,
                                 "prompt_mode": args.prompt_mode,
+                                "score_norm": args.score_norm,
                                 "prompt_prefix": prompt_prefixes[i],
                                 "prefix_token_len": tokenized_len,
+                                "pred_label_len": pred_label_len,
                                 "max_label_len_in_batch": max_label_len_in_batch,
                                 "estimated_concat_len": estimated_concat_len,
                                 "truncated": truncated,
@@ -765,12 +809,26 @@ def evaluate(args) -> None:
     zero_label_tokens_ratio = float(zero_label_tokens_count) / float(max(1, total_samples))
     anymatch_acc = float(anymatch_correct) / float(max(1, anymatch_total))
 
+    # Compute label_tokens_scored stats
+    if all_label_tokens_scored:
+        avg_label_tokens_scored = float(np.mean(all_label_tokens_scored))
+        min_label_tokens_scored = int(np.min(all_label_tokens_scored))
+        max_label_tokens_scored = int(np.max(all_label_tokens_scored))
+    else:
+        avg_label_tokens_scored = 0.0
+        min_label_tokens_scored = 0
+        max_label_tokens_scored = 0
+
     metrics = compute_metrics(y_true, y_pred, num_classes=len(SSGVQA_LABELS))
     summary = {
         "num_samples": num_samples,
+        "score_norm": args.score_norm,
         "avg_prompt_token_len": avg_prompt_token_len,
         "truncated_ratio": truncated_ratio,
         "zero_label_tokens_ratio": zero_label_tokens_ratio,
+        "avg_label_tokens_scored": avg_label_tokens_scored,
+        "min_label_tokens_scored": min_label_tokens_scored,
+        "max_label_tokens_scored": max_label_tokens_scored,
         "acc_first_label": metrics["acc"],
         "mAP": metrics["mAP"],
         "mAR": metrics["mAR"],
@@ -808,6 +866,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--prompt-mode", type=str, default="simple", choices=["simple", "choices"])
     parser.add_argument("--max-input-tokens", type=int, default=256)
     parser.add_argument("--label-chunk-size", type=int, default=10)
+    parser.add_argument("--score-norm", type=str, default="mean", choices=["sum", "mean"],
+                        help="Score normalization: 'sum' for raw logprob sum, 'mean' for length-normalized (default)")
 
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--strict-missing-image", action="store_true")
