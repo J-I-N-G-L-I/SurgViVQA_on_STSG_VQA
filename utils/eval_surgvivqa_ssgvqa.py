@@ -335,6 +335,7 @@ def greedy_generate(
 
 
 def score_labels_closedset(
+    model,
     video_embeds: torch.Tensor,
     video_atts: torch.Tensor,
     prompt_ids: torch.Tensor,
@@ -708,6 +709,7 @@ def evaluate(args) -> None:
 
                     video_embeds, video_atts = model.encode_video(videos.to(device))
                     closed_scores, closed_top5 = score_labels_closedset(
+                        model=model,
                         video_embeds=video_embeds,
                         video_atts=video_atts,
                         prompt_ids=prompt_ids,
