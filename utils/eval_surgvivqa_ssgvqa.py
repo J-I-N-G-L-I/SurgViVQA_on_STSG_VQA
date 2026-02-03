@@ -250,6 +250,9 @@ def generate_outputs(
     num_beams: int,
     device,
 ):
+    if num_beams != 1:
+        logging.warning("num_beams > 1 not supported in autoregressive mode; using greedy decoding.")
+        num_beams = 1
     tok = tokenizer(
         prompts,
         padding=True,
@@ -259,6 +262,10 @@ def generate_outputs(
     )
     input_ids = tok["input_ids"].to(device)
     attn_mask = tok["attention_mask"].to(device)
+    prompt_lens = attn_mask.sum(dim=1).long()
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
 
     video_embeds, video_atts = model.encode_video(videos.to(device))
     text_out = model.text_encoder(
@@ -270,27 +277,101 @@ def generate_outputs(
     )
     text_embeds = text_out.last_hidden_state
 
-    gen_ids = model.llm.generate(
-        inputs_embeds=text_embeds,
-        attention_mask=attn_mask,
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
-        num_beams=num_beams,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    bsz = input_ids.size(0)
+    cur_ids = input_ids
+    cur_att = attn_mask
+    finished = torch.zeros(bsz, dtype=torch.bool, device=device)
+    generated = []
 
-    max_prompt_len = input_ids.size(1)
-    gen_only = gen_ids[:, max_prompt_len:]
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            logits = model(
+                video=None,
+                qa_inputs_ids=cur_ids,
+                qa_att_mask=cur_att,
+                video_embeds=video_embeds,
+                video_atts=video_atts,
+            )
+            next_logits = logits[:, -1, :]
+
+            if do_sample:
+                temp = max(float(temperature), 1e-6)
+                probs = torch.softmax(next_logits / temp, dim=-1)
+                if top_p < 1.0:
+                    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                    cum = sorted_probs.cumsum(dim=-1)
+                    mask = cum > float(top_p)
+                    mask[:, 0] = False
+                    sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+                    sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+                    next_ids = torch.multinomial(sorted_probs, num_samples=1).squeeze(1)
+                    next_ids = sorted_idx.gather(1, next_ids.unsqueeze(1)).squeeze(1)
+                else:
+                    next_ids = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_ids = torch.argmax(next_logits, dim=-1)
+
+            if eos_id is not None:
+                next_ids = torch.where(finished, torch.tensor(pad_id, device=device), next_ids)
+                finished = finished | (next_ids == eos_id)
+
+            generated.append(next_ids)
+            next_att = (~finished).long()
+            cur_ids = torch.cat([cur_ids, next_ids.unsqueeze(1)], dim=1)
+            cur_att = torch.cat([cur_att, next_att.unsqueeze(1)], dim=1)
+
+            if bool(finished.all()):
+                break
+
+    if generated:
+        gen_only = torch.stack(generated, dim=1)
+    else:
+        gen_only = torch.empty((bsz, 0), dtype=torch.long, device=device)
+
+    gen_ids = torch.cat([input_ids, gen_only], dim=1)
+
+    # ---- Debug logging (first sample) ----
+    input_len = int(attn_mask[0].sum().item())
+    gen_seq_len = int(gen_ids.shape[1])
+    if gen_seq_len > int(prompt_lens[0].item()):
+        debug_gen = gen_ids[0, int(prompt_lens[0].item()):].tolist()
+    else:
+        debug_gen = gen_ids[0, :].tolist()
+    while debug_gen and pad_id is not None and debug_gen[0] == pad_id:
+        debug_gen = debug_gen[1:]
+    first_generated_is_eos = bool(debug_gen and eos_id is not None and debug_gen[0] == eos_id)
+    debug_head_ids = debug_gen[:20]
+    debug_head_text = tokenizer.decode(debug_head_ids, skip_special_tokens=True)
+
+    logging.info("[GenDebug] input_ids.shape=%s", tuple(input_ids.shape))
+    logging.info("[GenDebug] text_embeds.shape=%s", tuple(text_embeds.shape))
+    logging.info("[GenDebug] gen_ids.shape=%s", tuple(gen_ids.shape))
+    logging.info("[GenDebug] input_len=%d | gen_seq_len=%d", input_len, gen_seq_len)
+    logging.info("[GenDebug] prompt_len=%d", int(prompt_lens[0].item()))
+    logging.info("[GenDebug] first_generated_is_eos=%s", first_generated_is_eos)
+    logging.info("[GenDebug] decode_ids_head=%s", debug_head_ids)
+    logging.info("[GenDebug] decode_text_head=%s", debug_head_text.replace("\n", "\\n"))
 
     outputs: List[str] = []
     output_token_lens: List[int] = []
-    for i in range(gen_only.size(0)):
-        seq = gen_only[i].tolist()
-        if tokenizer.eos_token_id is not None and tokenizer.eos_token_id in seq:
-            seq = seq[: seq.index(tokenizer.eos_token_id)]
+    for i in range(bsz):
+        if gen_ids.shape[1] > int(prompt_lens[i].item()):
+            seq = gen_ids[i, int(prompt_lens[i].item()):].tolist()
+        else:
+            seq = gen_ids[i, :].tolist()
+
+        while seq and pad_id is not None and seq[0] == pad_id:
+            seq = seq[1:]
+
+        eos_immediate = bool(seq and eos_id is not None and seq[0] == eos_id)
+        if eos_immediate:
+            outputs.append("<EOS_IMMEDIATE>")
+            output_token_lens.append(0)
+            continue
+
+        if eos_id is not None and eos_id in seq:
+            seq = seq[: seq.index(eos_id)]
+
         output_token_lens.append(len(seq))
         outputs.append(tokenizer.decode(seq, skip_special_tokens=True).strip())
 
