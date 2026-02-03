@@ -9,22 +9,20 @@
 #SBATCH --error=logs/%x_%j.err
 
 set -e
+set -x
 mkdir -p logs
 
 source ~/.bashrc
 module load miniforge
 conda activate SurgViVQAEnv
 
-# ---- Cache locations (HuggingFace/torch) ----
 export HF_HOME=/mnt/scratch/sc232jl/hf_home
 export TORCH_HOME=/mnt/scratch/sc232jl/torch_cache
 export TOKENIZERS_PARALLELISM=false
 
-# ---- Project directory ----
 REPO_DIR=/mnt/scratch/sc232jl/SurgViVQA
 cd ${REPO_DIR}
 
-# ---- Paths (edit as needed) ----
 CKPT_PATH=/mnt/scratch/sc232jl/SurgViVQA/checkpoints/surgvivqa_gpt2_endovis_ckpt/best_model.pth
 SSGVQA_ROOT=/mnt/scratch/sc232jl/datasets/SSGVQA/ssg-qa
 IMAGE_ROOT=/mnt/scratch/sc232jl/datasets/CholecT45/data
@@ -34,9 +32,6 @@ PRED_FILE_SIMPLE=logs/ssgvqa_predictions_${SLURM_JOB_ID}_simple.jsonl
 LOG_FILE_CHOICES=logs/ssgvqa_eval_${SLURM_JOB_ID}_choices.log
 PRED_FILE_CHOICES=logs/ssgvqa_predictions_${SLURM_JOB_ID}_choices.jsonl
 
-# ----------------------------------------------
-# Example 1: simple prompt (short, natural QA)
-# ----------------------------------------------
 python utils/eval_surgvivqa_ssgvqa.py \
   --model-path ${CKPT_PATH} \
   --ssgvqa-root ${SSGVQA_ROOT} \
@@ -49,14 +44,9 @@ python utils/eval_surgvivqa_ssgvqa.py \
   --num-frames 16 \
   --prompt-mode simple \
   --max-input-tokens 128 \
+  --label-chunk-size 10 \
   --log-every-n 200
 
-# --------------------------------------------------------
-# Example 2: choices prompt (full label list as candidates)
-# Note: choices mode greatly increases prompt token count,
-# so you should increase --max-input-tokens accordingly.
-# Use --max-new-tokens to control output length.
-# --------------------------------------------------------
 python utils/eval_surgvivqa_ssgvqa.py \
   --model-path ${CKPT_PATH} \
   --ssgvqa-root ${SSGVQA_ROOT} \
@@ -68,5 +58,6 @@ python utils/eval_surgvivqa_ssgvqa.py \
   --workers 4 \
   --num-frames 16 \
   --prompt-mode choices \
-  --max-input-tokens 512 \
+  --max-input-tokens 1024 \
+  --label-chunk-size 10 \
   --log-every-n 200

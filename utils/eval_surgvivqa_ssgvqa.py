@@ -257,6 +257,15 @@ def score_labels_closedset(
     device,
     label_chunk_size: int = 10,
 ):
+    """
+    Closed-set scoring: for each sample and each label, compute teacher-forcing log-prob.
+    Returns:
+        scores: [B, num_labels]
+        tokenized_lens: list of prompt token lengths
+        trunc_flags: list of bool indicating truncation
+        label_tokens_scored: [B, num_labels] actual label tokens scored per sample/label
+        max_label_lens: [num_labels] max token length per label (for diagnostics)
+    """
     tok, input_ids, attn_mask = _tokenize_prefixes(tokenizer, prompt_prefixes, max_input_tokens)
     input_ids = input_ids.to(device)
     attn_mask = attn_mask.to(device)
@@ -267,22 +276,25 @@ def score_labels_closedset(
     video_embeds, video_atts = model.encode_video(videos.to(device))
 
     label_token_ids = _normalize_label_token_ids(tokenizer, labels)
+    label_token_lens = [len(ids) for ids in label_token_ids]
 
     bsz = input_ids.size(0)
     num_labels = len(labels)
     scores = torch.full((bsz, num_labels), -1e9, device=device, dtype=torch.float32)
+    label_tokens_scored = torch.zeros((bsz, num_labels), device=device, dtype=torch.long)
     trunc_flags = torch.zeros(bsz, dtype=torch.bool, device=device)
 
     for start in range(0, num_labels, label_chunk_size):
         end = min(start + label_chunk_size, num_labels)
+        chunk_size = end - start
         chunk_ids = label_token_ids[start:end]
 
         max_label_len = max((len(x) for x in chunk_ids), default=0)
         if max_label_len == 0:
             continue
 
-        label_ids = torch.full((end - start, max_label_len), pad_id, dtype=torch.long, device=device)
-        label_att = torch.zeros((end - start, max_label_len), dtype=torch.long, device=device)
+        label_ids = torch.full((chunk_size, max_label_len), pad_id, dtype=torch.long, device=device)
+        label_att = torch.zeros((chunk_size, max_label_len), dtype=torch.long, device=device)
         for i, ids in enumerate(chunk_ids):
             if not ids:
                 continue
@@ -290,8 +302,8 @@ def score_labels_closedset(
             label_att[i, : len(ids)] = 1
 
         # Expand prompts for label chunk
-        exp_input_ids = input_ids.unsqueeze(1).expand(bsz, end - start, -1).contiguous()
-        exp_att = attn_mask.unsqueeze(1).expand(bsz, end - start, -1).contiguous()
+        exp_input_ids = input_ids.unsqueeze(1).expand(bsz, chunk_size, -1).contiguous()
+        exp_att = attn_mask.unsqueeze(1).expand(bsz, chunk_size, -1).contiguous()
 
         exp_label_ids = label_ids.unsqueeze(0).expand(bsz, -1, -1).contiguous()
         exp_label_att = label_att.unsqueeze(0).expand(bsz, -1, -1).contiguous()
@@ -308,16 +320,24 @@ def score_labels_closedset(
             concat_ids = concat_ids[:, :, :max_input_tokens]
             concat_att = concat_att[:, :, :max_input_tokens]
 
-        flat_ids = concat_ids.view(bsz * (end - start), -1)
-        flat_att = concat_att.view(bsz * (end - start), -1)
+        flat_ids = concat_ids.view(bsz * chunk_size, -1)
+        flat_att = concat_att.view(bsz * chunk_size, -1)
+
+        # ---- Fix 1: Expand video_embeds/video_atts to match flat batch [B*chunk_size, ...] ----
+        # video_embeds: [B, V, D] -> [B, chunk_size, V, D] -> [B*chunk_size, V, D]
+        # video_atts:   [B, V]    -> [B, chunk_size, V]    -> [B*chunk_size, V]
+        video_embeds_exp = video_embeds.unsqueeze(1).expand(bsz, chunk_size, -1, -1).contiguous()
+        video_embeds_exp = video_embeds_exp.view(bsz * chunk_size, video_embeds.size(1), video_embeds.size(2))
+        video_atts_exp = video_atts.unsqueeze(1).expand(bsz, chunk_size, -1).contiguous()
+        video_atts_exp = video_atts_exp.view(bsz * chunk_size, video_atts.size(1))
 
         with torch.no_grad():
             logits = model(
                 video=None,
                 qa_inputs_ids=flat_ids,
                 qa_att_mask=flat_att,
-                video_embeds=video_embeds,
-                video_atts=video_atts,
+                video_embeds=video_embeds_exp,
+                video_atts=video_atts_exp,
             )
 
         log_probs = torch.log_softmax(logits, dim=-1)
@@ -327,10 +347,11 @@ def score_labels_closedset(
         shifted_log_probs = log_probs[:, :-1, :]
         shifted_ids = flat_ids[:, 1:]
 
-        flat_prompt_lens = prompt_lens.unsqueeze(1).expand(bsz, end - start).reshape(-1)
-        label_scores = torch.zeros(bsz * (end - start), device=device, dtype=torch.float32)
+        flat_prompt_lens = prompt_lens.unsqueeze(1).expand(bsz, chunk_size).reshape(-1)
+        chunk_label_scores = torch.zeros(bsz * chunk_size, device=device, dtype=torch.float32)
+        chunk_tokens_scored = torch.zeros(bsz * chunk_size, device=device, dtype=torch.long)
 
-        for i in range(bsz * (end - start)):
+        for i in range(bsz * chunk_size):
             pl = int(flat_prompt_lens[i].item())
             # label tokens start right after prompt
             start_pos = max(pl - 1, 0)
@@ -339,17 +360,21 @@ def score_labels_closedset(
                 continue
             token_ids = shifted_ids[i, start_pos:end_pos]
             token_att = flat_att[i, 1:][start_pos:end_pos]
-            if token_att.sum().item() == 0:
+            num_valid = int(token_att.sum().item())
+            chunk_tokens_scored[i] = num_valid
+            if num_valid == 0:
                 continue
             lp = shifted_log_probs[i, start_pos:end_pos, :].gather(1, token_ids.unsqueeze(1)).squeeze(1)
             lp = lp * token_att
-            label_scores[i] = lp.sum()
+            chunk_label_scores[i] = lp.sum()
 
-        label_scores = label_scores.view(bsz, end - start)
-        scores[:, start:end] = label_scores
+        chunk_label_scores = chunk_label_scores.view(bsz, chunk_size)
+        chunk_tokens_scored = chunk_tokens_scored.view(bsz, chunk_size)
+        scores[:, start:end] = chunk_label_scores
+        label_tokens_scored[:, start:end] = chunk_tokens_scored
 
     tokenized_lens = attn_mask.sum(dim=1).tolist()
-    return scores, tokenized_lens, trunc_flags.tolist()
+    return scores, tokenized_lens, trunc_flags.tolist(), label_tokens_scored, label_token_lens
 
 
 # -----------------------------
@@ -505,6 +530,21 @@ def load_checkpoint(model, ckpt_path: str) -> None:
     logging.info("[CKPT] missing keys: %d", len(missing))
     logging.info("[CKPT] unexpected keys: %d", len(unexpected))
 
+    # Enhancement 4: checkpoint load reliability
+    if missing:
+        logging.info("[CKPT] missing keys (first 30): %s", missing[:30])
+    if unexpected:
+        logging.info("[CKPT] unexpected keys (first 30): %s", unexpected[:30])
+
+    total_params = sum(1 for _ in model.state_dict().keys())
+    if len(unexpected) > 50 or (total_params > 0 and len(unexpected) / total_params > 0.1):
+        logging.warning(
+            "[CKPT] WARNING: %d unexpected keys (%.1f%% of model params). "
+            "Checkpoint may not match current model structure. Evaluation results may be unreliable!",
+            len(unexpected),
+            100.0 * len(unexpected) / max(1, total_params),
+        )
+
 
 def evaluate(args) -> None:
     pred_dir = os.path.dirname(args.predictions_file)
@@ -540,6 +580,17 @@ def evaluate(args) -> None:
 
     load_checkpoint(model, args.model_path)
 
+    # Enhancement 5: num_frames consistency check
+    model_num_frames = getattr(model, "num_frames", None)
+    logging.info("[Config] args.num_frames=%d, model.num_frames=%s", args.num_frames, model_num_frames)
+    if model_num_frames is not None and int(model_num_frames) != int(args.num_frames):
+        logging.warning(
+            "[Config] WARNING: num_frames mismatch! args.num_frames=%d but model.num_frames=%d. "
+            "Consider using model.num_frames or adjusting --num-frames accordingly.",
+            args.num_frames,
+            model_num_frames,
+        )
+
     dataset = SSGVQAStaticDataset(
         ssgvqa_root=args.ssgvqa_root,
         image_root=args.image_root,
@@ -564,10 +615,11 @@ def evaluate(args) -> None:
     total_samples = 0
     total_prompt_tokens = 0
     truncated_count = 0
+    zero_label_tokens_count = 0
     y_true: List[int] = []
     y_pred: List[int] = []
-    y_true_any: List[int] = []
-    y_pred_any: List[int] = []
+    anymatch_correct = 0
+    anymatch_total = 0
     exact_map, norm_map = build_label_maps(SSGVQA_LABELS)
 
     with open(args.predictions_file, "w", encoding="utf-8") as fout:
@@ -582,7 +634,7 @@ def evaluate(args) -> None:
                     logging.info("Images tensor shape: %s", tuple(videos.shape))
 
                 prompt_prefixes = [build_prompt_prefix(q, args.prompt_mode) for q in questions]
-                scores, tokenized_lens, truncated_flags = score_labels_closedset(
+                scores, tokenized_lens, truncated_flags, label_tokens_scored, label_token_lens = score_labels_closedset(
                     model=model,
                     tokenizer=tokenizer,
                     videos=videos,
@@ -613,16 +665,16 @@ def evaluate(args) -> None:
                 ):
                     gt_label = gt.strip()
                     gt_labels = [s.strip() for s in gt_label.split(",") if s.strip()]
+
+                    # Build gt_set for any-match evaluation
+                    gt_set = set()
                     gt_idx_first = -1
-                    gt_idx_any = -1
-                    if gt_labels:
-                        for candidate in gt_labels:
-                            mapped_label, mapped_idx = map_pred_to_label(candidate, SSGVQA_LABELS, exact_map, norm_map)
-                            if mapped_idx != -1:
-                                if gt_idx_first == -1:
-                                    gt_idx_first = mapped_idx
-                                gt_idx_any = mapped_idx
-                                break
+                    for candidate in gt_labels:
+                        mapped_label, mapped_idx = map_pred_to_label(candidate, SSGVQA_LABELS, exact_map, norm_map)
+                        if mapped_idx != -1:
+                            gt_set.add(mapped_label)
+                            if gt_idx_first == -1:
+                                gt_idx_first = mapped_idx
 
                     row_scores = scores[i].detach().cpu()
                     pred_idx = int(torch.argmax(row_scores).item())
@@ -631,16 +683,37 @@ def evaluate(args) -> None:
                     tokenized_len = int(tokenized_lens[i])
                     truncated = bool(truncated_flags[i])
 
+                    # Enhancement 3: Truncation diagnostics
+                    pred_label_tokens_scored = int(label_tokens_scored[i, pred_idx].item())
+                    max_label_len_in_batch = max(label_token_lens)
+                    estimated_concat_len = tokenized_len + max_label_len_in_batch
+
                     total_samples += 1
                     total_prompt_tokens += tokenized_len
                     if truncated:
                         truncated_count += 1
+                    if pred_label_tokens_scored == 0:
+                        zero_label_tokens_count += 1
+                        logging.warning(
+                            "[WARN] Sample %d: label_tokens_scored=0 for pred_label=%s. "
+                            "Score may be meaningless due to truncation. prefix_len=%d, max_label_len=%d, max_input_tokens=%d",
+                            processed,
+                            pred_label,
+                            tokenized_len,
+                            max_label_len_in_batch,
+                            args.max_input_tokens,
+                        )
+
+                    # First-label metrics (single-label)
                     if gt_idx_first != -1:
                         y_true.append(gt_idx_first)
                         y_pred.append(pred_idx)
-                    if gt_idx_any != -1:
-                        y_true_any.append(gt_idx_any)
-                        y_pred_any.append(pred_idx)
+
+                    # Any-match metrics (multi-label)
+                    if gt_set:
+                        anymatch_total += 1
+                        if pred_label in gt_set:
+                            anymatch_correct += 1
 
                     topk = min(5, len(SSGVQA_LABELS))
                     top_scores, top_indices = torch.topk(row_scores, k=topk, largest=True)
@@ -660,11 +733,14 @@ def evaluate(args) -> None:
                                 "gt_answer": gt_label,
                                 "prompt_mode": args.prompt_mode,
                                 "prompt_prefix": prompt_prefixes[i],
-                                "tokenized_len": tokenized_len,
+                                "prefix_token_len": tokenized_len,
+                                "max_label_len_in_batch": max_label_len_in_batch,
+                                "estimated_concat_len": estimated_concat_len,
                                 "truncated": truncated,
                                 "max_input_tokens": int(args.max_input_tokens),
                                 "pred_label": pred_label,
                                 "pred_idx": pred_idx,
+                                "label_tokens_scored": pred_label_tokens_scored,
                                 "top5": top5,
                             },
                             ensure_ascii=False,
@@ -686,24 +762,32 @@ def evaluate(args) -> None:
     num_samples = int(total_samples)
     avg_prompt_token_len = float(total_prompt_tokens) / float(max(1, total_samples))
     truncated_ratio = float(truncated_count) / float(max(1, total_samples))
+    zero_label_tokens_ratio = float(zero_label_tokens_count) / float(max(1, total_samples))
+    anymatch_acc = float(anymatch_correct) / float(max(1, anymatch_total))
 
     metrics = compute_metrics(y_true, y_pred, num_classes=len(SSGVQA_LABELS))
-    metrics_any = compute_metrics(y_true_any, y_pred_any, num_classes=len(SSGVQA_LABELS))
     summary = {
         "num_samples": num_samples,
         "avg_prompt_token_len": avg_prompt_token_len,
         "truncated_ratio": truncated_ratio,
-        "acc": metrics["acc"],
+        "zero_label_tokens_ratio": zero_label_tokens_ratio,
+        "acc_first_label": metrics["acc"],
         "mAP": metrics["mAP"],
         "mAR": metrics["mAR"],
         "mAF1": metrics["mAF1"],
         "wF1": metrics["wF1"],
-        "acc_any": metrics_any["acc"],
-        "mAP_any": metrics_any["mAP"],
-        "mAR_any": metrics_any["mAR"],
-        "mAF1_any": metrics_any["mAF1"],
-        "wF1_any": metrics_any["wF1"],
+        "anymatch_acc": anymatch_acc,
+        "anymatch_total": anymatch_total,
+        "anymatch_correct": anymatch_correct,
     }
+
+    if zero_label_tokens_ratio > 0:
+        logging.warning(
+            "[Summary] %.2f%% samples have label_tokens_scored=0. "
+            "Consider increasing --max-input-tokens (current=%d).",
+            100.0 * zero_label_tokens_ratio,
+            args.max_input_tokens,
+        )
 
     logging.info("Summary: %s", summary)
     logging.info("Saved predictions: %s", args.predictions_file)
