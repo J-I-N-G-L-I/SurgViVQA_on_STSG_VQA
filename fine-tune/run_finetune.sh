@@ -64,6 +64,8 @@ mkdir -p logs
 # Activate conda environment (adjust as needed for your HPC)
 # source ~/.bashrc
 # conda activate surgvivqa
+module load miniforge
+conda activate SurgViVQAEnv
 
 # ============================================================================
 # Data Paths (adjust for your HPC environment)
