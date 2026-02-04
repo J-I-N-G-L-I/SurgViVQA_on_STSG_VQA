@@ -31,7 +31,32 @@ LOG_FILE_SIMPLE=logs/ssgvqa_eval_${SLURM_JOB_ID}_simple.log
 PRED_FILE_SIMPLE=logs/ssgvqa_predictions_${SLURM_JOB_ID}_simple.jsonl
 LOG_FILE_CHOICES=logs/ssgvqa_eval_${SLURM_JOB_ID}_choices.log
 PRED_FILE_CHOICES=logs/ssgvqa_predictions_${SLURM_JOB_ID}_choices.jsonl
+LOG_FILE_DIAG=logs/ssgvqa_eval_${SLURM_JOB_ID}_diag.log
+PRED_FILE_DIAG=logs/ssgvqa_predictions_${SLURM_JOB_ID}_diag.jsonl
 
+# ========================
+# Diagnostic mode (batch_size=1, debug_first_n=50)
+# ========================
+python utils/eval_surgvivqa_ssgvqa.py \
+  --model-path ${CKPT_PATH} \
+  --ssgvqa-root ${SSGVQA_ROOT} \
+  --image-root ${IMAGE_ROOT} \
+  --videos VID02 \
+  --log-file ${LOG_FILE_DIAG} \
+  --predictions-file ${PRED_FILE_DIAG} \
+  --batch-size 1 \
+  --workers 2 \
+  --num-frames 16 \
+  --prompt-mode simple \
+  --max-input-tokens 128 \
+  --label-chunk-size 10 \
+  --score-norm mean \
+  --debug-first-n 50 \
+  --log-every-n 10
+
+# ========================
+# Simple mode (full evaluation)
+# ========================
 python utils/eval_surgvivqa_ssgvqa.py \
   --model-path ${CKPT_PATH} \
   --ssgvqa-root ${SSGVQA_ROOT} \
@@ -45,8 +70,12 @@ python utils/eval_surgvivqa_ssgvqa.py \
   --prompt-mode simple \
   --max-input-tokens 128 \
   --label-chunk-size 10 \
+  --score-norm mean \
   --log-every-n 200
 
+# ========================
+# Choices mode (full evaluation)
+# ========================
 python utils/eval_surgvivqa_ssgvqa.py \
   --model-path ${CKPT_PATH} \
   --ssgvqa-root ${SSGVQA_ROOT} \
@@ -60,4 +89,5 @@ python utils/eval_surgvivqa_ssgvqa.py \
   --prompt-mode choices \
   --max-input-tokens 1024 \
   --label-chunk-size 10 \
+  --score-norm mean \
   --log-every-n 200
