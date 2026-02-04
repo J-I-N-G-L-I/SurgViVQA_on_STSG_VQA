@@ -1,6 +1,15 @@
-# SurgViVQA Fine-tuning on SSGVQA
+# SurgViVQA Fine-tuning on SSGVQA (FIXED VERSION)
 
-This folder contains the complete fine-tuning pipeline for training SurgViVQA on the SSGVQA dataset.
+This folder contains the **fixed** fine-tuning pipeline for training SurgViVQA on the SSGVQA dataset.
+
+## Key Fixes (v2)
+
+1. **LoRA-only by default**: Only LoRA adapters trainable (~0.15% params), BLIP and GPT-2 base frozen
+2. **Proper loss alignment**: Correct causal LM label masking with diagnostic output
+3. **Step-based training**: `--max-steps` flag for predictable HPC job times
+4. **AMP support**: `--fp16` or `--bf16` for faster training
+5. **Split verification**: Automatic check for train/val/test overlap
+6. **Sanity check script**: Pre-flight verification before submitting jobs
 
 ## Overview
 
@@ -11,12 +20,13 @@ The pipeline enables supervised instruction fine-tuning (SFT) of SurgViVQA on SS
 ```
 fine-tune/
 ├── README.md                 # This file
-├── labels.py                 # 52-class label vocabulary (matches evaluation)
+├── labels.py                 # 51-class label vocabulary (matches evaluation)
 ├── dataset.py                # SSGVQA dataset loader for training
 ├── trainer.py                # Training utilities (SFT loss, checkpoint saving)
-├── train_ssgvqa.py           # Main fine-tuning script
+├── train_ssgvqa.py           # Main fine-tuning script (FIXED)
+├── sanity_check.py           # Pre-flight verification script (NEW)
 ├── eval_finetuned.py         # Evaluation wrapper script
-├── run_finetune.sh           # HPC training script (SLURM compatible)
+├── run_finetune.sh           # HPC training script (SLURM compatible, FIXED)
 ├── run_eval.sh               # HPC evaluation script (SLURM compatible)
 ├── splits/
 │   ├── train_videos.json     # 35 training video IDs
@@ -48,19 +58,36 @@ See `labels.py` for the complete ordered list.
 
 ## Quick Start
 
-### 1. Fine-tuning (LoRA, recommended)
+### 0. Pre-flight Check (RECOMMENDED)
+
+Before submitting a training job, verify the setup:
 
 ```bash
-# On Aire HPC with SLURM
+python fine-tune/sanity_check.py \
+    --ssgvqa-root /mnt/scratch/sc232jl/datasets/SSGVQA/ssg-qa/ \
+    --image-root /mnt/scratch/sc232jl/datasets/CholecT45/data
+```
+
+Expected output:
+- All checks PASS
+- Trainable params ~0.15% (LoRA-only)
+- Loss ~3-5 (cross-entropy on 51 classes)
+
+### 1. Fine-tuning (LoRA, recommended for 12h SLURM job)
+
+```bash
+# On Aire HPC with SLURM (submit from project root!)
+cd /path/to/SurgViVQA_on_STSG_VQA
 sbatch fine-tune/run_finetune.sh
 
-# Or run directly
+# Or run directly with step-based training
 python fine-tune/train_ssgvqa.py \
     --ssgvqa-root /mnt/scratch/sc232jl/datasets/SSGVQA/ssg-qa/ \
     --image-root /mnt/scratch/sc232jl/datasets/CholecT45/data \
-    --epochs 30 \
-    --batch-size 4 \
-    --lr 2e-5 \
+    --max-steps 30000 \
+    --batch-size 8 \
+    --lr 5e-4 \
+    --fp16 \
     --prompt-mode simple
 ```
 
@@ -71,7 +98,8 @@ python fine-tune/train_ssgvqa.py \
     --ssgvqa-root /mnt/scratch/sc232jl/datasets/SSGVQA/ssg-qa/ \
     --image-root /mnt/scratch/sc232jl/datasets/CholecT45/data \
     --full-finetune \
-    --epochs 30 \
+    --train-gpt2-full \
+    --max-steps 10000 \
     --batch-size 2 \
     --lr 1e-6 \
     --prompt-mode simple
@@ -89,9 +117,40 @@ python fine-tune/eval_finetuned.py \
 bash fine-tune/run_eval.sh fine-tune/ckpt/best_model.pth simple
 ```
 
-## Training Details
+## Training Configuration
 
-### Prompt Format
+### Freeze Control (CRITICAL)
+
+By default, only LoRA adapters are trainable:
+- **VideoMAE**: Always frozen
+- **BLIP text encoder**: Frozen by default, use `--train-blip` to unfreeze
+- **GPT-2 base weights**: Frozen by default, use `--train-gpt2-full` to unfreeze
+- **LoRA adapters**: TRAINABLE (~590K params)
+
+Expected trainable params: **~0.15%** (LoRA-only)
+
+If you see ~42% trainable params, something is wrong!
+
+### Step-based Training
+
+For predictable HPC job times, use `--max-steps`:
+
+```bash
+# 30K steps with BS=8 takes ~10-12 hours on single GPU
+python train_ssgvqa.py \
+    --max-steps 30000 \
+    --eval-every-steps 2000 \
+    --save-every-steps 5000 \
+    --batch-size 8
+```
+
+### Mixed Precision (AMP)
+
+For faster training:
+- Use `--fp16` for FP16 (any GPU)
+- Use `--bf16` for BF16 (Ampere+ GPU)
+
+## Prompt Format
 
 The training uses prompts compatible with the existing evaluation script:
 

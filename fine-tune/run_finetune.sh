@@ -1,28 +1,30 @@
 #!/bin/bash
 #
-# SSGVQA Fine-tuning script for SurgViVQA on Aire HPC
+# SSGVQA Fine-tuning script for SurgViVQA on Aire HPC (FIXED VERSION)
 #
-# This script fine-tunes SurgViVQA on the SSGVQA dataset using LoRA (default)
-# for efficient single-GPU training.
+# Key fixes:
+#   - LoRA-only by default: Only LoRA adapters trainable (~0.15% params)
+#   - Step-based training: --max-steps for predictable HPC job times
+#   - AMP support: --fp16 or --bf16 for faster training
+#   - Realistic defaults for 12-hour SLURM job
 #
 # Usage:
-#   sbatch run_finetune.sh
-#   # or directly:
-#   bash run_finetune.sh
+#   cd /path/to/SurgViVQA_on_STSG_VQA  # IMPORTANT: must be in project root
+#   sbatch fine-tune/run_finetune.sh
 #
 # Test split (NEVER for training): VID02, VID22, VID43, VID60, VID74
 #
 # After training completes, evaluate with:
-#   bash run_eval.sh
+#   bash fine-tune/run_eval.sh
 #
 
 # ============================================================================
 # SLURM Configuration (for Aire HPC)
 # ============================================================================
-#SBATCH --job-name=surgvivqa_ssgvqa_finetune
+#SBATCH --job-name=ssgvqa_lora_ft
 #SBATCH --output=logs/finetune_%j.out
 #SBATCH --error=logs/finetune_%j.err
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -34,22 +36,21 @@
 # Environment Setup
 # ============================================================================
 echo "========================================"
-echo "SurgViVQA Fine-tuning on SSGVQA"
+echo "SurgViVQA LoRA Fine-tuning on SSGVQA (FIXED)"
 echo "========================================"
 echo "Date: $(date)"
 echo "Host: $(hostname)"
+echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "========================================"
 
 # ============================================================================
 # Resolve project root directory
-# When submitted via sbatch, use SLURM_SUBMIT_DIR; otherwise use script location
+# IMPORTANT: Run `sbatch fine-tune/run_finetune.sh` from project root!
 # ============================================================================
 if [ -n "${SLURM_SUBMIT_DIR}" ]; then
-    # Running under SLURM - use the directory where sbatch was called
     PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
 else
-    # Running directly - resolve from script location
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
 fi
@@ -61,35 +62,49 @@ echo "Working directory: $(pwd)"
 # Create logs directory
 mkdir -p logs
 
-# Activate conda environment (adjust as needed for your HPC)
-# source ~/.bashrc
-# conda activate surgvivqa
-module load miniforge
+# Activate conda environment
+module load miniforge 2>/dev/null || true
 conda activate SurgViVQAEnv
 
 # ============================================================================
-# Data Paths (adjust for your HPC environment)
+# Data Paths
 # ============================================================================
 SSGVQA_ROOT="/mnt/scratch/sc232jl/datasets/SSGVQA/ssg-qa/"
 IMAGE_ROOT="/mnt/scratch/sc232jl/datasets/CholecT45/data"
 
 # ============================================================================
-# Training Configuration
+# Training Configuration (OPTIMIZED for 12-hour SLURM job)
 # ============================================================================
-# Default: LoRA fine-tuning (lower VRAM, ~8-12GB)
-# For full fine-tuning, add --full-finetune and reduce batch size
+# LoRA-only fine-tuning (default): ~0.15% params trainable
+# With 723K samples and BS=8, 1 epoch = ~90K steps
+# For 12h job: ~30K steps achievable (about 1/3 epoch)
 
-EPOCHS=30
-BATCH_SIZE=4
-LR=2e-5
+MAX_STEPS=30000           # Step-based training for predictable time
+EVAL_EVERY=2000           # Validate every N steps
+SAVE_EVERY=5000           # Checkpoint every N steps
+VAL_MAX_SAMPLES=20000     # Limit val set for faster eval
+
+BATCH_SIZE=8              # Higher batch size for better throughput
+LR=5e-4                   # Higher LR for LoRA-only (fewer params to update)
 NUM_FRAMES=16
 MAX_LENGTH=128
-PROMPT_MODE="simple"  # or "choices" for longer prompts with all labels
+PROMPT_MODE="simple"
 
-# LoRA configuration
+# LoRA configuration (only LoRA weights trainable by default)
 LORA_R=8
 LORA_ALPHA=32
 LORA_DROPOUT=0.1
+
+# AMP for faster training (use --bf16 if on Ampere GPU, else --fp16)
+AMP_FLAG="--fp16"
+
+# ============================================================================
+# Freeze Control (CRITICAL for LoRA-only)
+# ============================================================================
+# Default: VideoMAE frozen, BLIP frozen, GPT-2 base frozen, only LoRA trainable
+# To train BLIP: add --train-blip
+# To train GPT-2 base: add --train-gpt2-full
+# To train last N layers of BLIP: add --unfreeze-blip-last-n N
 
 # ============================================================================
 # Output Configuration
@@ -103,12 +118,21 @@ echo ""
 echo "Configuration:"
 echo "  SSGVQA Root: ${SSGVQA_ROOT}"
 echo "  Image Root: ${IMAGE_ROOT}"
-echo "  Epochs: ${EPOCHS}"
+echo "  Max Steps: ${MAX_STEPS}"
 echo "  Batch Size: ${BATCH_SIZE}"
 echo "  Learning Rate: ${LR}"
 echo "  Num Frames: ${NUM_FRAMES}"
 echo "  Prompt Mode: ${PROMPT_MODE}"
+echo "  AMP: ${AMP_FLAG}"
+echo "  Eval Every: ${EVAL_EVERY} steps"
+echo "  Save Every: ${SAVE_EVERY} steps"
 echo "  Output Dir: ${OUTPUT_DIR}"
+echo ""
+echo "Freeze settings (LoRA-only by default):"
+echo "  - VideoMAE: frozen"
+echo "  - BLIP text encoder: frozen (add --train-blip to unfreeze)"
+echo "  - GPT-2 base: frozen (add --train-gpt2-full to unfreeze)"
+echo "  - LoRA adapters: TRAINABLE"
 echo ""
 
 # ============================================================================
@@ -117,7 +141,10 @@ echo ""
 python "${PROJECT_ROOT}/fine-tune/train_ssgvqa.py" \
     --ssgvqa-root "${SSGVQA_ROOT}" \
     --image-root "${IMAGE_ROOT}" \
-    --epochs "${EPOCHS}" \
+    --max-steps "${MAX_STEPS}" \
+    --eval-every-steps "${EVAL_EVERY}" \
+    --save-every-steps "${SAVE_EVERY}" \
+    --val-max-samples "${VAL_MAX_SAMPLES}" \
     --batch-size "${BATCH_SIZE}" \
     --lr "${LR}" \
     --num-frames "${NUM_FRAMES}" \
@@ -129,7 +156,8 @@ python "${PROJECT_ROOT}/fine-tune/train_ssgvqa.py" \
     --checkpoint-dir "${OUTPUT_DIR}" \
     --workers 4 \
     --seed 42 \
-    --log-interval 50
+    --log-interval 100 \
+    ${AMP_FLAG}
 
 # ============================================================================
 # Check Exit Status
