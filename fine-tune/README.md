@@ -4,7 +4,7 @@ This folder contains the complete fine-tuning pipeline for training SurgViVQA on
 
 ## Overview
 
-The pipeline enables supervised instruction fine-tuning (SFT) of SurgViVQA on SSGVQA's 52-class closed-set VQA task. It supports both LoRA (PEFT) fine-tuning (default, lower VRAM) and full fine-tuning.
+The pipeline enables supervised instruction fine-tuning (SFT) of SurgViVQA on SSGVQA's 51-class closed-set VQA task. It supports both LoRA (PEFT) fine-tuning (default, lower VRAM) and full fine-tuning.
 
 ## Directory Structure
 
@@ -36,7 +36,7 @@ Following SSGVQA-Net conventions:
 
 ## Label Vocabulary
 
-The 52-class label space includes:
+The 51-class label space includes:
 - Numeric (0-10): counting answers
 - Boolean (False, True): existence/yes-no answers
 - Anatomical structures: cystic_artery, cystic_duct, gallbladder, liver, etc.
@@ -156,7 +156,7 @@ Evaluation uses the same metrics as SSGVQA-Net:
 - Check that prompt mode matches between training and evaluation
 
 ### Label Mismatch
-- Ensure the 52-class label vocabulary in `labels.py` matches the evaluation script
+- Ensure the 51-class label vocabulary in `labels.py` matches the evaluation script
 - Labels must be in the EXACT same order
 
 ## Files Reference

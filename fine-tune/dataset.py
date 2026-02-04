@@ -50,7 +50,7 @@ class SSGVQADataset(Dataset):
         image_root: Root directory of CholecT45 frame images
         video_ids: List of video IDs to include (e.g., ["VID02", "VID22"])
         processor: Image processor (e.g., from VideoMAE) for preprocessing
-        label2idx: Label string -> index mapping (52-class)
+        label2idx: Label string -> index mapping (51-class)
         norm_label_map: Normalized label -> index mapping for fuzzy matching
         num_frames: Number of frames to use for video input (frames are repeated for static images)
         prompt_mode: "simple" or "choices" - controls prompt format

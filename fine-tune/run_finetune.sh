@@ -41,16 +41,29 @@ echo "Host: $(hostname)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "========================================"
 
+# ============================================================================
+# Resolve project root directory
+# When submitted via sbatch, use SLURM_SUBMIT_DIR; otherwise use script location
+# ============================================================================
+if [ -n "${SLURM_SUBMIT_DIR}" ]; then
+    # Running under SLURM - use the directory where sbatch was called
+    PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
+else
+    # Running directly - resolve from script location
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
+fi
+
+cd "${PROJECT_ROOT}" || { echo "ERROR: Cannot cd to ${PROJECT_ROOT}"; exit 1; }
+echo "Project root: ${PROJECT_ROOT}"
+echo "Working directory: $(pwd)"
+
 # Create logs directory
 mkdir -p logs
 
 # Activate conda environment (adjust as needed for your HPC)
 # source ~/.bashrc
 # conda activate surgvivqa
-
-# Change to project root
-cd "$(dirname "$0")/.." || exit 1
-echo "Working directory: $(pwd)"
 
 # ============================================================================
 # Data Paths (adjust for your HPC environment)
@@ -79,7 +92,7 @@ LORA_DROPOUT=0.1
 # ============================================================================
 # Output Configuration
 # ============================================================================
-CHECKPOINT_DIR="fine-tune/ckpt"
+CHECKPOINT_DIR="${PROJECT_ROOT}/fine-tune/ckpt"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RUN_NAME="ssgvqa_lora_${PROMPT_MODE}_${TIMESTAMP}"
 OUTPUT_DIR="${CHECKPOINT_DIR}/${RUN_NAME}"
@@ -99,7 +112,7 @@ echo ""
 # ============================================================================
 # Run Training
 # ============================================================================
-python fine-tune/train_ssgvqa.py \
+python "${PROJECT_ROOT}/fine-tune/train_ssgvqa.py" \
     --ssgvqa-root "${SSGVQA_ROOT}" \
     --image-root "${IMAGE_ROOT}" \
     --epochs "${EPOCHS}" \

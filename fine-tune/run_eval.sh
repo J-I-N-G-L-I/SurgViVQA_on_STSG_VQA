@@ -40,6 +40,23 @@ PROMPT_MODE="${2:-simple}"
 SSGVQA_ROOT="/mnt/scratch/sc232jl/datasets/SSGVQA/ssg-qa/"
 IMAGE_ROOT="/mnt/scratch/sc232jl/datasets/CholecT45/data"
 
+# ============================================================================
+# Resolve project root directory
+# When submitted via sbatch, use SLURM_SUBMIT_DIR; otherwise use script location
+# ============================================================================
+if [ -n "${SLURM_SUBMIT_DIR}" ]; then
+    # Running under SLURM - use the directory where sbatch was called
+    PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
+else
+    # Running directly - resolve from script location
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
+fi
+
+cd "${PROJECT_ROOT}" || { echo "ERROR: Cannot cd to ${PROJECT_ROOT}"; exit 1; }
+echo "Project root: ${PROJECT_ROOT}"
+echo "Working directory: $(pwd)"
+
 # Create logs directory
 mkdir -p logs
 
@@ -62,20 +79,20 @@ echo "  Image Root: ${IMAGE_ROOT}"
 echo "  Test Videos: VID02, VID22, VID43, VID60, VID74"
 echo ""
 
-# Check if checkpoint exists
+# Check if checkpoint exists (resolve relative paths from project root)
+if [[ ! "${CHECKPOINT}" = /* ]]; then
+    CHECKPOINT="${PROJECT_ROOT}/${CHECKPOINT}"
+fi
+
 if [ ! -f "${CHECKPOINT}" ]; then
     echo "ERROR: Checkpoint not found: ${CHECKPOINT}"
     exit 1
 fi
 
-# Change to project root
-cd "$(dirname "$0")/.." || exit 1
-echo "Working directory: $(pwd)"
-
 # ============================================================================
 # Run Evaluation
 # ============================================================================
-python fine-tune/eval_finetuned.py \
+python "${PROJECT_ROOT}/fine-tune/eval_finetuned.py" \
     --checkpoint "${CHECKPOINT}" \
     --ssgvqa-root "${SSGVQA_ROOT}" \
     --image-root "${IMAGE_ROOT}" \

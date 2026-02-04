@@ -2,7 +2,7 @@
 SurgViVQA Fine-tuning on SSGVQA Dataset
 
 This package provides the complete fine-tuning pipeline for training
-SurgViVQA on SSGVQA's 52-class closed-set VQA task.
+SurgViVQA on SSGVQA's 51-class closed-set VQA task.
 
 Modules:
 - labels: 52-class label vocabulary and mapping utilities

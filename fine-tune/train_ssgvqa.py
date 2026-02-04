@@ -18,7 +18,7 @@ Usage:
         --full-finetune --epochs 30 --batch-size 2 --lr 1e-6
 
 Key Features:
-- Closed-set 52-class label vocabulary (matches SSGVQA-Net evaluation)
+- Closed-set 51-class label vocabulary (matches SSGVQA-Net evaluation)
 - SFT training with prompt masking (loss only on answer tokens)
 - LoRA/PEFT fine-tuning by default (lower VRAM usage)
 - Optional full fine-tuning via --full-finetune flag
