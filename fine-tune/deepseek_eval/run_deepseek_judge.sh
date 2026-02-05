@@ -83,6 +83,8 @@ PROJECT_ROOT="${PROJECT_ROOT:-/mnt/scratch/sc232jl/SurgViVQA}"
 
 # Input predictions file (output from utils/eval_surgvivqa_ssgvqa.py)
 PRED_JSONL="${PRED_JSONL:-${PROJECT_ROOT}/fine-tune/ckpt/ssgvqa_lora_simple_20260204_122024/test_predictions.jsonl}"
+
+
 # Output paths
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/fine-tune/deepseek_eval/outputs}"
 OUT_JUDGED="${OUT_JUDGED:-${OUTPUT_DIR}/surgvivqa_ssgvqa_judged.jsonl}"
@@ -111,32 +113,6 @@ MAX_SAMPLES="${MAX_SAMPLES:-}"
 SAVE_RAW="${SAVE_RAW:-0}"
 
 # -----------------------------------------------------------------------------
-# Build command
-# -----------------------------------------------------------------------------
-
-CMD="python -u ${PROJECT_ROOT}/fine-tune/deepseek_eval/evaluate.py"
-CMD+=" --predictions-jsonl \"$PRED_JSONL\""
-CMD+=" --output-judged-jsonl \"$OUT_JUDGED\""
-CMD+=" --output-metrics-json \"$OUT_METRICS\""
-CMD+=" --base-url \"$DEEPSEEK_BASE_URL\""
-CMD+=" --judge-model \"$DEEPSEEK_MODEL\""
-CMD+=" --sleep-seconds $SLEEP_SECONDS"
-CMD+=" --num-workers $NUM_WORKERS"
-CMD+=" --save-every 100"
-
-if [ "$RESUME" = "1" ]; then
-    CMD+=" --resume"
-fi
-
-if [ -n "$MAX_SAMPLES" ]; then
-    CMD+=" --max-samples $MAX_SAMPLES"
-fi
-
-if [ "$SAVE_RAW" = "1" ]; then
-    CMD+=" --save-raw"
-fi
-
-# -----------------------------------------------------------------------------
 # Run
 # -----------------------------------------------------------------------------
 
@@ -161,13 +137,35 @@ if [ ! -f "$PRED_JSONL" ]; then
     exit 1
 fi
 
+# Build command arguments
+CMD_ARGS="--predictions-jsonl $PRED_JSONL"
+CMD_ARGS+=" --output-judged-jsonl $OUT_JUDGED"
+CMD_ARGS+=" --output-metrics-json $OUT_METRICS"
+CMD_ARGS+=" --base-url $DEEPSEEK_BASE_URL"
+CMD_ARGS+=" --judge-model $DEEPSEEK_MODEL"
+CMD_ARGS+=" --sleep-seconds $SLEEP_SECONDS"
+CMD_ARGS+=" --num-workers $NUM_WORKERS"
+CMD_ARGS+=" --save-every 100"
+
+if [ "$RESUME" = "1" ]; then
+    CMD_ARGS+=" --resume"
+fi
+
+if [ -n "$MAX_SAMPLES" ]; then
+    CMD_ARGS+=" --max-samples $MAX_SAMPLES"
+fi
+
+if [ "$SAVE_RAW" = "1" ]; then
+    CMD_ARGS+=" --save-raw"
+fi
+
 # Execute (use srun if running under SLURM)
 if [ -n "${SLURM_JOB_ID:-}" ]; then
     echo "[INFO] Running under SLURM (job $SLURM_JOB_ID)"
-    srun -u $CMD
+    srun -u python -u ${PROJECT_ROOT}/fine-tune/deepseek_eval/evaluate.py $CMD_ARGS
 else
     echo "[INFO] Running locally"
-    eval $CMD
+    python -u ${PROJECT_ROOT}/fine-tune/deepseek_eval/evaluate.py $CMD_ARGS
 fi
 
 echo ""
