@@ -39,7 +39,7 @@ if command -v module &> /dev/null; then
 fi
 
 # Activate conda environment
-CONDA_ENV="${CONDA_ENV:-surgvivqa}"
+CONDA_ENV="${CONDA_ENV:-SurgViVQAEnv}"
 if [ -n "$CONDA_DEFAULT_ENV" ]; then
     echo "[INFO] Conda environment already active: $CONDA_DEFAULT_ENV"
 elif command -v conda &> /dev/null; then
@@ -79,7 +79,7 @@ export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-deepseek-chat}"
 
 # Project root (adjust if needed)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+PROJECT_ROOT="${PROJECT_ROOT:-/mnt/scratch/sc232jl/SurgViVQA}"
 
 # Input predictions file (output from utils/eval_surgvivqa_ssgvqa.py)
 PRED_JSONL="${PRED_JSONL:-${PROJECT_ROOT}/fine-tune/ckpt/ssgvqa_lora_simple_20260204_122024/test_predictions.jsonl}"
