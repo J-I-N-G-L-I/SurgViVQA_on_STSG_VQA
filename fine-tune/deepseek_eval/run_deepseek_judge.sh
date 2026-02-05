@@ -59,6 +59,8 @@ export PYTHONUNBUFFERED=1
 # DeepSeek API configuration
 # -----------------------------------------------------------------------------
 
+export DEEPSEEK_API_KEY="sk-2fe42d7497c142c78752716fcae4838e"
+
 # API key (REQUIRED - set this before running)
 if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
     echo "[ERROR] DEEPSEEK_API_KEY is not set."
@@ -80,10 +82,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 # Input predictions file (output from utils/eval_surgvivqa_ssgvqa.py)
-PRED_JSONL="${PRED_JSONL:-${PROJECT_ROOT}/outputs/surgvivqa_ssgvqa_predictions.jsonl}"
-
+PRED_JSONL="${PRED_JSONL:-${PROJECT_ROOT}/fine-tune/ckpt/ssgvqa_lora_simple_20260204_122024/test_predictions.jsonl}"
 # Output paths
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/deepseek_eval}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/fine-tune/deepseek_eval/outputs}"
 OUT_JUDGED="${OUT_JUDGED:-${OUTPUT_DIR}/surgvivqa_ssgvqa_judged.jsonl}"
 OUT_METRICS="${OUT_METRICS:-${OUTPUT_DIR}/surgvivqa_ssgvqa_metrics.json}"
 
